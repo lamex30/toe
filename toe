@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # ───────────────────────────── paths & config ──────────────────────────────
 
@@ -146,6 +146,15 @@ class UI:
     # ── colors ──
     def fix(self, s):
         return s.translate(self.TTY_TEXT) if self.mode == "console" else s
+
+    def fit(self, s):
+        """One screen line: glyphs replaced first (the console's '...' is wider than '…'), then cut
+        to the width, so a line never wraps and throws off an in-place redraw."""
+        s = self.fix(s)
+        w = self.width - 1
+        if visible_len(s) > w:
+            s = self.fix(truncate_visible(s, w - 2))
+        return s
 
     def c(self, code, s):
         if not self.color:
@@ -342,8 +351,7 @@ class UI:
         txt = f"{pre}  {self.bar(frac, 24)} {self.bold(f'{int(frac * 100):3d}%')} {label}"
         if extra:
             txt += " " + self.dim(extra)
-        txt = truncate_visible(txt, self.width - 1)
-        sys.stdout.write("\r\033[K" + self.fix(txt))
+        sys.stdout.write("\r\033[K" + self.fit(txt))
         sys.stdout.flush()
 
     def progress_end(self):
@@ -388,17 +396,16 @@ class UI:
             nonlocal lines_drawn
             if lines_drawn:
                 sys.stdout.write(f"\033[{lines_drawn}A")
-            out = [f"\r\033[K{v}",
-                   f"\r\033[K{self.purple(self.sym['tee'])}  {self.bold(title)}"]
+            out = [v, f"{self.purple(self.sym['tee'])}  {self.bold(title)}"]
             for i, it in enumerate(items):
                 mark = self.purple(self.sym["sel"]) if i == cur else " "
-                line = f"\r\033[K{v}  {mark} {self.bold(it) if i == cur else it}"
-                out.append(truncate_visible(line, self.width + 40))
+                out.append(f"{v}  {mark} {self.bold(it) if i == cur else it}")
             det = details[cur] if details else ""
-            out.append(f"\r\033[K{v}    " + self.dim(truncate_visible(det, self.width - 8)))
-            out.append(f"\r\033[K{v}    " + self.dim(T(self.sym['ud'] + 'jk выбрать · Enter ок · q отмена',
-                                                         self.sym['ud'] + 'jk move · Enter pick · q cancel')))
-            sys.stdout.write(self.fix("\n".join(out)) + "\n")
+            out.append(f"{v}    " + self.dim(det))
+            out.append(f"{v}    " + self.dim(T(self.sym['ud'] + 'jk выбрать · Enter ок · q отмена',
+                                               self.sym['ud'] + 'jk move · Enter pick · q cancel')))
+            # every line fits the screen, or a wrapped one would break the redraw above
+            sys.stdout.write("".join(f"\r\033[K{self.fit(l)}\n" for l in out))
             sys.stdout.flush()
             lines_drawn = len(out)
 
@@ -445,8 +452,7 @@ class Live:
         if not self.tty:
             return
         self._clear()
-        w = self.ui.width - 1
-        sys.stdout.write("".join(self.ui.fix(truncate_visible(l, w)) + "\n" for l in lines))
+        sys.stdout.write("".join(self.ui.fit(l) + "\n" for l in lines))
         sys.stdout.flush()
         self.drawn = len(lines)
 
@@ -1170,6 +1176,16 @@ def remote_details(e):
     e["latest"] = vers[-1]
 
 
+def portage_reload():
+    """Make Portage read its configuration again (repos.conf after eselect repository enable)."""
+    try:
+        import portage
+        portage._reset_legacy_globals()
+        return True
+    except Exception:
+        return False
+
+
 def enable_overlay(name):
     """eselect repository enable NAME + sync it. Returns a journal record, or None on failure."""
     if run(["eselect", "repository", "list"], capture=True)[0] != 0:
@@ -1823,7 +1839,6 @@ def cmd_install(a, argv):
     aliases = load_aliases()
     ui.head(T("Ищу пакеты", "Looking up packages"))
     atoms, picked = [], []
-    overlay_records = []
     flatpak_wanted = []
     for q in a.packages:
         if q.startswith("@"):
@@ -1837,9 +1852,16 @@ def cmd_install(a, argv):
             got = try_overlays(q, idx, res)
             if got:
                 cp_new, rec = got
-                overlay_records.append(rec)
+                # journaled right away, so toe undo disables the overlay even if this run stops here
+                journal_add(" ".join(sys.argv), [rec], [cp_new])
+                # Portage read repos.conf when toe started; it must read it again to see the overlay.
+                portage_reload()
                 idx = load_index(force=True)
-                res = resolve(cp_new, idx, aliases)
+                if cp_new not in idx.by_cp:
+                    ui.step(T("перезапускаю toe, чтобы Portage увидел новый оверлей", "restarting toe so Portage sees the new overlay"))
+                    sys.stdout.flush()
+                    os.execv(sys.executable, [sys.executable, os.path.realpath(sys.argv[0])] + argv)
+                res = Resolution("exact", [Match(idx.by_cp[cp_new], 1.0, 1)], q, "")
         if res.kind == "none" or not res.matches:
             ui.out(T(f"   {ui.red(ui.sym['err'])} «{q}» не нашла в подключённых репозиториях", f"   {ui.red(ui.sym['err'])} «{q}» not found in enabled repositories"))
             fp = flatpak_search(q) if CONF["flatpak_fallback"] != "never" else []
@@ -1888,7 +1910,7 @@ def cmd_install(a, argv):
     if a.oneshot:
         flags.append("--oneshot")
 
-    records = list(overlay_records)
+    records = []
     asked_bin = False
     for attempt in range(8):
         if attempt == 0:
