@@ -10,6 +10,7 @@ toe update
 ```
 
 - **Finds packages by loose names.** `mangowindowmanager`, `mango-wm` and `Mango WM` all find `gui-wm/mangowm`; `vscode`, `rg` and `nvim` work too. An inexact match always asks first.
+- **Finds packages in overlays too.** When a package isn't in the enabled repositories, toe looks in [GURU](https://wiki.gentoo.org/wiki/Project:GURU) (and any overlay you add to `search_overlays` in `/etc/toe/toe.conf`), offers to enable that overlay, syncs it, unmasks `~amd64` with your yes, and installs: `toe install mangowm` is all it takes. `toe undo` disables the overlay again. `toe search` lists overlay packages too.
 - **Says what downloads and what compiles.** When a package has a prebuilt `-bin` version (`firefox-bin`, `rust-bin`, …), toe asks which one you want and tells you whether the regular one would compile from source. Packages that compile get a warning before you say yes.
 - **Sorts out `/etc/portage` for you.** Keywords (`~amd64`), USE flags and licenses that emerge needs are shown once, written to toe's own `zz-toe-*` files on yes, and `toe undo` reverts them.
 - **Removes safely.** `toe remove` uses `--deselect` and `--depclean`, never `--unmerge`, and won't remove core system packages.
