@@ -1,0 +1,2578 @@
+#!/usr/bin/env python3
+# toe — friendly package manager front-end for Gentoo (wraps Portage/emerge)
+# SPDX-License-Identifier: MIT
+"""toe — install/remove/search Gentoo packages by human names.
+
+  toe install fastfetch mangowindowmanager
+  toe remove fastfetch
+  toe search "pdf viewer"
+"""
+
+import argparse
+import datetime as _dt
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "0.2.0"
+
+# ───────────────────────────── paths & config ──────────────────────────────
+
+ETC_DIR = "/etc/toe"
+CONF_FILE = os.path.join(ETC_DIR, "toe.conf")
+ALIAS_DIR = os.path.join(ETC_DIR, "aliases.d")
+STATE_DIR = "/var/lib/toe"
+JOURNAL = os.path.join(STATE_DIR, "changes.json")
+LEARNED = os.path.join(STATE_DIR, "learned.json")
+CACHE_DIR = "/var/cache/toe"
+USER_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "toe")
+LOG_FILE = "/var/log/toe.log"
+PORTAGE_ETC = "/etc/portage"
+WORLD_FILE = "/var/lib/portage/world"
+SNAPSHOT_BIN = "/usr/local/sbin/snapshot"
+POSTSYNC_HOOK = "/etc/portage/postsync.d/60-toe"
+
+DEFAULT_CONF = {
+    "prefer_binary": True,
+    "confirm_exact": False,
+    "fuzzy_threshold": 0.82,
+    "fuzzy_margin": 0.08,
+    "snapshot": "auto",          # auto | always | never
+    "flatpak_fallback": "ask",   # ask | never
+    "show_command": False,
+    "sync_max_age_days": 7,
+    "color": "auto",             # auto | always | never
+    "fancy": True,               # unicode/box drawing; False = plain ASCII
+    "lang": "auto",              # auto | en | ru
+    "symbols": "auto",           # auto | unicode | console (Linux TTY) | ascii
+    "update_url": "https://raw.githubusercontent.com/lamex30/toe/main/toe",
+}
+
+
+def load_conf():
+    conf = dict(DEFAULT_CONF)
+    try:
+        with open(CONF_FILE) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = (x.strip() for x in line.split("=", 1))
+                if k not in conf:
+                    continue
+                d = DEFAULT_CONF[k]
+                if isinstance(d, bool):
+                    conf[k] = v.lower() in ("1", "true", "yes", "on")
+                elif isinstance(d, float):
+                    conf[k] = float(v)
+                elif isinstance(d, int):
+                    conf[k] = int(v)
+                else:
+                    conf[k] = v
+    except OSError:
+        pass
+    return conf
+
+
+CONF = load_conf()
+
+
+def detect_lang():
+    """TOE_LANG env > lang in toe.conf > LC_ALL > LC_MESSAGES > LANG (POSIX order)."""
+    forced = os.environ.get("TOE_LANG") or (CONF["lang"] if CONF["lang"] != "auto" else "")
+    if forced:
+        return "ru" if forced.lower().startswith("ru") else "en"
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        v = os.environ.get(var, "")
+        if v:
+            return "ru" if v.lower().startswith("ru") else "en"
+    return "en"
+
+
+LANG = detect_lang()
+
+
+def T(ru, en):
+    """Pick the message for the current language (both versions live side by side)."""
+    return ru if LANG == "ru" else en
+
+# ───────────────────────────────── UI ──────────────────────────────────────
+# Design "6a": a timeline rail on the left, OpenRC-style service lines
+#   │ * Building gui-wm/mangowm-0.10.5 ........ [ ok ]
+# wget-style bars under the running package and a total bar at the bottom.
+
+
+class UI:
+    # 256-color codes → 16-color equivalents for the Linux console
+    TTY_COLORS = {"38;5;141": "35", "1;38;5;141": "1;35", "38;5;183": "1;35", "1;38;5;183": "1;35",
+                  "1;38;5;255;48;5;61": "1;37;45", "38;5;60": "35", "38;5;245": "37"}
+    # glyphs missing from console fonts (default8x16, Lat2-Terminus16 …)
+    TTY_TEXT = str.maketrans({"—": "-", "–": "-", "−": "-", "→": "->", "…": "...", "♡": "",
+                              "✓": "+", "✗": "x", "❯": ">", "•": "*", "▸": ">", "↑": "", "↓": "",
+                              "╭": "┌", "╮": "┐", "╰": "└", "╯": "┘", "‘": "'", "’": "'"})
+    SPIN_UNI = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    SPIN_ASCII = ["|", "/", "-", "\\"]
+
+    def __init__(self):
+        mode = CONF["color"]
+        self.color = (mode == "always") or (mode == "auto" and sys.stdout.isatty()
+                                            and os.environ.get("NO_COLOR") is None)
+        utf = "utf" in (os.environ.get("LC_ALL", "") + os.environ.get("LC_CTYPE", "") + os.environ.get("LANG", "")).lower()
+        sym_mode = CONF["symbols"]
+        if sym_mode == "auto":
+            if os.environ.get("TERM") == "linux":
+                sym_mode = "console"
+            elif utf and CONF["fancy"]:
+                sym_mode = "unicode"
+            else:
+                sym_mode = "ascii"
+        self.mode = sym_mode
+        self.fancy = sym_mode == "unicode"
+        self.yes = False
+        self.quiet = False
+        self.verbose = False
+        self.width = shutil.get_terminal_size((80, 24)).columns
+        self.rail = False          # inside a ┌ … └ timeline
+        self.final = None          # message for the closing └ line
+        self.t0 = time.time()
+
+    # ── colors ──
+    def fix(self, s):
+        return s.translate(self.TTY_TEXT) if self.mode == "console" else s
+
+    def c(self, code, s):
+        if not self.color:
+            return s
+        if self.mode == "console":
+            code = self.TTY_COLORS.get(code, code)
+        return f"\033[{code}m{s}\033[0m"
+
+    def bold(self, s): return self.c("1", s)
+    def dim(self, s): return self.c("2", s)
+    def red(self, s): return self.c("31", s)
+    def green(self, s): return self.c("32", s)
+    def yellow(self, s): return self.c("33", s)
+    def blue(self, s): return self.c("34", s)
+    def magenta(self, s): return self.c("35", s)
+    def cyan(self, s): return self.c("36", s)
+    def purple(self, s): return self.c("38;5;141", s)
+    def lavender(self, s): return self.c("38;5;183", s)
+    pink = purple
+    def star_g(self): return self.c("1;32", "*")
+    def star_y(self): return self.c("1;33", "*")
+    def star_r(self): return self.c("1;31", "*")
+    def br(self, s): return self.c("1;34", s)          # OpenRC blue brackets
+
+    @property
+    def sym(self):
+        if self.mode == "unicode":
+            return dict(head="❯❯", ok="✓", err="✗", arrow="→", dot="·", sel="▸", heart="♡", ud="↑↓/",
+                        v="│", top="┌", tee="├", end="└", hl="─", lead=".")
+        if self.mode == "console":
+            return dict(head=">>>", ok="+", err="x", arrow="->", dot="·", sel=">", heart="", ud="",
+                        v="│", top="┌", tee="├", end="└", hl="─", lead=".")
+        return dict(head=">>>", ok="+", err="x", arrow="->", dot=".", sel=">", heart="", ud="",
+                    v="|", top="+", tee="+", end="+", hl="-", lead=".")
+
+    def spinner(self, n):
+        sp = self.SPIN_UNI if self.mode == "unicode" else self.SPIN_ASCII
+        return sp[n % len(sp)]
+
+    # ── raw output ──
+    def _p(self, s, err=False):
+        self._blank = ANSI_RE.sub("", s).strip() == self.sym["v"]
+        print(self.fix(s), file=sys.stderr if err else sys.stdout, flush=True)
+
+    def rail_prefix(self, kind="v"):
+        return self.dim(self.sym[kind]) if kind == "v" else self.purple(self.sym[kind])
+
+    def out(self, s=""):
+        if self.rail:
+            self._p(self.rail_prefix() + (" " + s if s else ""))
+        else:
+            self._p(s)
+
+    # ── timeline ──
+    def start(self, cmd, detail=""):
+        """┌  [toe] install foo"""
+        if self.quiet:
+            return
+        self.rail = True
+        self.t0 = time.time()
+        pill = self.c("1;38;5;255;48;5;61", " toe ") if self.color else "[toe]"
+        self._p(f"{self.purple(self.sym['top'])}  {pill} {self.bold(cmd)}" + (f" {self.dim(detail)}" if detail else ""))
+        self._p(self.rail_prefix())
+
+    def close(self, rc):
+        if not self.rail:
+            return
+        self.rail = False
+        el = int(time.time() - self.t0)
+        tm = self.dim(f"{el // 60}:{el % 60:02d}")
+        if self.final:
+            msg = self.final
+        elif rc == 0:
+            msg = self.c("1;32", T("готово", "done"))
+        elif rc == 130:
+            msg = self.yellow(T("отменено", "cancelled"))
+        else:
+            msg = self.c("1;31", T("не получилось", "failed"))
+        heart = (" " + self.purple(self.sym["heart"])) if rc == 0 and self.sym["heart"] else ""
+        self._p(f"{self.purple(self.sym['end'])}  {msg} {self.dim(self.sym['dot'])} {tm}{heart}")
+
+    def head(self, s):
+        """├  Section"""
+        if self.rail:
+            if not getattr(self, "_blank", False):
+                self._p(self.rail_prefix())
+            self._p(f"{self.purple(self.sym['tee'])}  {self.bold(s)}")
+        else:
+            self._p(f"{self.c('1;38;5;141', self.sym['head'])} {self.bold(s)}")
+
+    def step(self, s):
+        if not self.quiet:
+            self.out(f"{self.star_g()} {s}")
+
+    def ok(self, s):
+        self.out(f"{self.star_g()} {s}")
+
+    def warn(self, s):
+        self.out(f"{self.star_y()} {s}")
+
+    def err(self, s):
+        if self.rail:
+            self.out(f"{self.star_r()} {s}")
+        else:
+            self._p(f"{self.star_r()} {self.c('1;31', 'error:')} {s}", err=True)
+
+    # ── OpenRC service line ──
+    def lead_width(self):
+        return max(30, min(self.width, 96) - 14)
+
+    def service(self, text, state, spin=0):
+        """* text ........ [ ok ]   state: ok | fail | wait | run | skip"""
+        w = self.lead_width()
+        text = truncate_visible(text, w - 3)
+        dots = self.dim(self.sym["lead"] * max(2, w - visible_len(text)))
+        star = {"fail": self.star_r(), "skip": self.star_y()}.get(state, self.star_g())
+        tag = {"ok": self.c("1;32", "ok"), "fail": self.c("1;31", "!!"), "skip": self.c("1;33", "--"),
+               "wait": self.dim(".."), "run": self.cyan(self.spinner(spin) + " ")}[state]
+        return f"{star} {text} {dots} {self.br('[')} {tag} {self.br(']')}"
+
+    # ── wget bar ──
+    def bar(self, frac, width, fill_color=None, indeterminate_pos=None):
+        """[=====>      ]   or bouncing [   <=>   ] when the fraction is unknown"""
+        fill_color = fill_color or self.purple
+        if indeterminate_pos is not None:
+            span = max(1, width - 3)
+            pos = indeterminate_pos % (2 * span)
+            pos = pos if pos < span else 2 * span - pos
+            inner = " " * pos + fill_color("<=>") + " " * (width - 3 - pos)
+            return self.br("[") + inner + self.br("]")
+        frac = max(0.0, min(1.0, frac))
+        k = int(frac * width)
+        if k >= width:
+            body = "=" * width
+        elif k > 0:
+            body = "=" * (k - 1) + ">"
+        else:
+            body = ""
+        return self.br("[") + fill_color(body) + " " * (width - len(body)) + self.br("]")
+
+    def badge(self, kind):
+        b = {
+            "bin": ("1;32", "bin"), "src": ("1;33", "src"), "ovl": ("38;5;141", "ovl"),
+            "inst": ("1;34", "inst"), "new": ("1;32", "N"), "upd": ("1;36", "U"),
+            "re": ("2", "R"), "dn": ("1;33", "D"), "del": ("1;31", "-"), "flat": ("1;36", "flatpak"),
+        }[kind]
+        return self.c(b[0], b[1])
+
+    def table(self, rows, aligns=None, indent="  "):
+        if not rows:
+            return
+        n = len(rows[0])
+        widths = [max(visible_len(r[i]) for r in rows) for i in range(n)]
+        aligns = aligns or ["l"] * n
+        for r in rows:
+            cells = []
+            for i, cell in enumerate(r):
+                pad = widths[i] - visible_len(cell)
+                cells.append(" " * pad + cell if aligns[i] == "r" else cell + " " * pad)
+            self.out(indent + "  ".join(cells).rstrip())
+
+    def box(self, title, lines):
+        """kept for compatibility: rendered as a rail section"""
+        self.head(title)
+        for ln in lines:
+            self.out("  " + ln)
+
+    # ── questions ──
+    def ask(self, question, default=True):
+        if self.yes:
+            return default
+        hint = "[Y/n]" if default else "[y/N]"
+        if self.rail:
+            if not getattr(self, "_blank", False):
+                self._p(self.rail_prefix())
+            self._blank = False
+            prompt = f"{self.purple(self.sym['tee'])}  {self.bold(question)} {self.dim(hint)} "
+        else:
+            prompt = f"{self.c('1;38;5;141', self.sym['head'])} {self.bold(question)} {self.dim(hint)} "
+        try:
+            ans = input(self.fix(prompt)).strip().lower()
+        except EOFError:
+            return default
+        if not ans:
+            return default
+        return ans in ("y", "yes", "д", "да")
+
+    # single-line progress (index building etc.)
+    def progress(self, done, total, label, extra=""):
+        if not sys.stdout.isatty() or self.quiet:
+            return
+        frac = 0 if total == 0 else done / total
+        pre = (self.rail_prefix() + " ") if self.rail else ""
+        txt = f"{pre}  {self.bar(frac, 24)} {self.bold(f'{int(frac * 100):3d}%')} {label}"
+        if extra:
+            txt += " " + self.dim(extra)
+        txt = truncate_visible(txt, self.width - 1)
+        sys.stdout.write("\r\033[K" + self.fix(txt))
+        sys.stdout.flush()
+
+    def progress_end(self):
+        if sys.stdout.isatty() and not self.quiet:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+    # ── picker ──
+    def pick(self, title, items, details=None):
+        if self.yes:
+            return None
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return self._pick_numbers(title, items)
+        try:
+            return self._pick_arrows(title, items, details)
+        except Exception:
+            return self._pick_numbers(title, items)
+
+    def _pick_numbers(self, title, items):
+        self.head(title)
+        for i, it in enumerate(items, 1):
+            self.out(f"  {self.bold(str(i)):>3}  {it}")
+        try:
+            ans = input(self.fix(f"{self.purple(self.sym['tee'])}  {self.bold(T('Номер (Enter — отмена):', 'Number (Enter to cancel):'))} ")).strip()
+        except EOFError:
+            return None
+        if ans.isdigit() and 1 <= int(ans) <= len(items):
+            return int(ans) - 1
+        return None
+
+    def _pick_arrows(self, title, items, details):
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        cur = 0
+        n = len(items)
+        lines_drawn = 0
+        v = self.rail_prefix()
+
+        def draw():
+            nonlocal lines_drawn
+            if lines_drawn:
+                sys.stdout.write(f"\033[{lines_drawn}A")
+            out = [f"\r\033[K{v}",
+                   f"\r\033[K{self.purple(self.sym['tee'])}  {self.bold(title)}"]
+            for i, it in enumerate(items):
+                mark = self.purple(self.sym["sel"]) if i == cur else " "
+                line = f"\r\033[K{v}  {mark} {self.bold(it) if i == cur else it}"
+                out.append(truncate_visible(line, self.width + 40))
+            det = details[cur] if details else ""
+            out.append(f"\r\033[K{v}    " + self.dim(truncate_visible(det, self.width - 8)))
+            out.append(f"\r\033[K{v}    " + self.dim(T(self.sym['ud'] + 'jk выбрать · Enter ок · q отмена',
+                                                         self.sym['ud'] + 'jk move · Enter pick · q cancel')))
+            sys.stdout.write(self.fix("\n".join(out)) + "\n")
+            sys.stdout.flush()
+            lines_drawn = len(out)
+
+        sys.stdout.write("\033[?25l")
+        try:
+            tty.setcbreak(fd)
+            draw()
+            while True:
+                ch = os.read(fd, 3)
+                if ch in (b"\x1b[A", b"k"):
+                    cur = (cur - 1) % n
+                elif ch in (b"\x1b[B", b"j"):
+                    cur = (cur + 1) % n
+                elif ch in (b"\r", b"\n"):
+                    return cur
+                elif ch in (b"q", b"\x1b", b"\x03"):
+                    return None
+                elif ch.isdigit() and 1 <= int(ch) <= n:
+                    cur = int(ch) - 1
+                draw()
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+
+
+class Live:
+    """A block of lines at the bottom of the screen that is redrawn in place;
+    finished lines are printed above it permanently."""
+
+    def __init__(self, ui):
+        self.ui = ui
+        self.drawn = 0
+        self.last = []
+        self.tty = sys.stdout.isatty()
+
+    def _clear(self):
+        if self.drawn and self.tty:
+            sys.stdout.write(f"\033[{self.drawn}F\033[J")
+        self.drawn = 0
+
+    def show(self, lines):
+        self.last = lines
+        if not self.tty:
+            return
+        self._clear()
+        w = self.ui.width - 1
+        sys.stdout.write("".join(self.ui.fix(truncate_visible(l, w)) + "\n" for l in lines))
+        sys.stdout.flush()
+        self.drawn = len(lines)
+
+    def above(self, line):
+        self._clear()
+        self.ui.out(line)
+        if self.tty:
+            self.show(self.last)
+
+    def stop(self):
+        self._clear()
+        self.last = []
+        sys.stdout.flush()
+
+
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def visible_len(s):
+    return len(ANSI_RE.sub("", s))
+
+
+def truncate_visible(s, maxlen):
+    if visible_len(s) <= maxlen:
+        return s
+    out, n, i = [], 0, 0
+    while i < len(s) and n < maxlen - 1:
+        m = ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group())
+            i = m.end()
+            continue
+        out.append(s[i])
+        n += 1
+        i += 1
+    return "".join(out) + "…\033[0m"
+
+
+ui = UI()
+
+# ───────────────────────────── helpers ─────────────────────────────────────
+
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{_dt.datetime.now().isoformat(timespec='seconds')} {msg}\n")
+    except OSError:
+        pass
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def ensure_root(argv):
+    """Re-exec through sudo/doas for commands that change the system."""
+    if is_root():
+        return
+    for tool in ("doas", "sudo"):
+        p = shutil.which(tool)
+        if p:
+            os.execvp(p, [p, sys.executable, os.path.abspath(sys.argv[0])] + argv)
+    ui.err(T("нужны права root, а sudo/doas не найдены", "root is required, but sudo/doas were not found"))
+    sys.exit(1)
+
+
+def run(cmd, capture=False, env_extra=None):
+    env = dict(os.environ)
+    env.update({"NOCOLOR": "true", "LC_ALL": "C"} if capture else {})
+    if env_extra:
+        env.update(env_extra)
+    if CONF["show_command"] or ui.verbose:
+        ui.out(ui.dim("   $ " + " ".join(cmd)))
+    log("run: " + " ".join(cmd))
+    if capture:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        return p.returncode, p.stdout
+    return subprocess.call(cmd, env=env), ""
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+# ─────────────────────────── name helpers ──────────────────────────────────
+
+CPV_RE = re.compile(r"^(?P<cp>[\w+][\w+.-]*/[\w+][\w+-]*?)-(?P<ver>\d[\w.]*(?:_(?:alpha|beta|pre|rc|p)\d*)*(?:-r\d+)?)$")
+
+
+def cpv_to_cp(cpv):
+    cpv = cpv.split("::", 1)[0].lstrip("=<>~")
+    m = CPV_RE.match(cpv)
+    return m.group("cp") if m else cpv
+
+
+def cpv_version(cpv):
+    m = CPV_RE.match(cpv.split("::", 1)[0].lstrip("=<>~"))
+    return m.group("ver") if m else ""
+
+
+def norm(s):
+    return re.sub(r"[\s\-_.+]+", "", s.lower())
+
+
+# ─────────────────────────────── index ─────────────────────────────────────
+
+class Index:
+    """Package metadata index (from Portage) + live installed/binary sets."""
+
+    def __init__(self, entries, installed=None, binary=None, world=None):
+        self.entries = entries                    # list of dicts
+        self.by_cp = {e["cp"]: e for e in entries}
+        self.by_pn = {}
+        self.by_norm = {}
+        for e in entries:
+            self.by_pn.setdefault(e["pn"], []).append(e)
+            self.by_norm.setdefault(e["norm"], []).append(e)
+        self.installed = installed or set()
+        self.binary = binary or set()
+        self.world = world or set()
+
+    @staticmethod
+    def make_entry(cp, desc="", homepage="", repos=(), stable=False, visible=True, upstream=()):
+        cat, pn = cp.split("/", 1)
+        return {"cp": cp, "cat": cat, "pn": pn, "norm": norm(pn), "desc": desc,
+                "homepage": homepage, "repos": list(repos), "stable": stable,
+                "visible": visible, "upstream": list(upstream)}
+
+
+def _portage():
+    try:
+        import portage  # noqa
+        return portage
+    except ImportError:
+        ui.err(T("не найден модуль portage для этого python. Запусти toe тем python, "
+               "под который собран portage (например: python3.13 /usr/bin/toe)", "portage module not found for this python. Run toe with the python "
+               "portage is built for (e.g. python3.13 /usr/bin/toe)"))
+        sys.exit(1)
+
+
+def repo_stamp(portdb):
+    parts = []
+    for repo in portdb.getRepositories():
+        path = portdb.getRepositoryPath(repo)
+        for f in ("metadata/timestamp.chk", "metadata/timestamp.x", ".git/FETCH_HEAD", ""):
+            p = os.path.join(path, f)
+            if os.path.exists(p):
+                parts.append(f"{repo}:{int(os.path.getmtime(p))}")
+                break
+    return "|".join(sorted(parts))
+
+
+def cache_path(write=False):
+    sys_p = os.path.join(CACHE_DIR, "index.json")
+    if is_root() or (os.path.exists(sys_p) and not write):
+        return sys_p
+    return os.path.join(USER_CACHE_DIR, "index.json")
+
+
+def upstream_ids(path):
+    ids = []
+    try:
+        with open(path) as f:
+            txt = f.read()
+        for m in re.finditer(r'<remote-id type="[^"]+">([^<]+)</remote-id>', txt):
+            ids.append(m.group(1).rsplit("/", 1)[-1])
+    except OSError:
+        pass
+    return ids
+
+
+def build_entries(portage, portdb, show=True):
+    arch = portage.settings.get("ARCH", "amd64")
+    repos_of = {}
+    for repo in portdb.getRepositories():
+        path = portdb.getRepositoryPath(repo)
+        for cp in portdb.cp_all(trees=[path]):
+            repos_of.setdefault(cp, []).append(repo)
+    entries = []
+    total = len(repos_of)
+    for i, (cp, repos) in enumerate(sorted(repos_of.items())):
+        if show and i % 250 == 0:
+            ui.progress(i, total, T("индексирую дерево", "indexing tree"), cp)
+        best = portdb.xmatch("bestmatch-visible", cp)
+        cpvs = portdb.cp_list(cp)
+        target = best or (cpvs[-1] if cpvs else None)
+        desc = homepage = ""
+        stable = False
+        if target:
+            try:
+                desc, homepage, kw = portdb.aux_get(target, ["DESCRIPTION", "HOMEPAGE", "KEYWORDS"])
+                stable = arch in kw.split()
+            except Exception:
+                pass
+        ups = []
+        for repo in repos:
+            ups += upstream_ids(os.path.join(portdb.getRepositoryPath(repo), cp, "metadata.xml"))
+        entries.append(Index.make_entry(cp, desc, homepage.split()[0] if homepage else "",
+                                        repos, stable, bool(best), ups))
+    if show:
+        ui.progress_end()
+    return entries
+
+
+def binary_cps(portage):
+    cps = set()
+    pkgdir = portage.settings.get("PKGDIR", "/var/cache/binpkgs")
+    files = glob.glob("/var/cache/binhost/**/Packages", recursive=True)
+    files += glob.glob("/var/cache/edb/binhost/**/Packages", recursive=True)
+    files.append(os.path.join(pkgdir, "Packages"))
+    for fn in files:
+        try:
+            with open(fn, errors="replace") as f:
+                for line in f:
+                    if line.startswith("CPV: "):
+                        cps.add(cpv_to_cp(line[5:].strip()))
+        except OSError:
+            pass
+    return cps
+
+
+def read_world():
+    w = set()
+    try:
+        with open(WORLD_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    w.add(line.split(":")[0])
+    except OSError:
+        pass
+    return w
+
+
+def load_index(force=False, show=True):
+    portage = _portage()
+    eroot = portage.settings["EROOT"]
+    portdb = portage.db[eroot]["porttree"].dbapi
+    vardb = portage.db[eroot]["vartree"].dbapi
+    stamp = repo_stamp(portdb)
+    data = None
+    if not force:
+        for p in (cache_path(), os.path.join(USER_CACHE_DIR, "index.json")):
+            d = read_json(p, None)
+            if d and d.get("stamp") == stamp and d.get("version") == VERSION:
+                data = d
+                break
+    if data is None:
+        if show:
+            ui.head(T("Обновляю индекс пакетов", "Updating package index"))
+        entries = build_entries(portage, portdb, show)
+        data = {"version": VERSION, "stamp": stamp, "entries": entries}
+        for p in (cache_path(write=True), os.path.join(USER_CACHE_DIR, "index.json")):
+            try:
+                write_json(p, data)
+                break
+            except OSError:
+                continue
+        if show:
+            ui.ok(T(f"в индексе {len(entries)} пакетов", f"{len(entries)} packages indexed"))
+    return Index(data["entries"], set(vardb.cp_all()), binary_cps(portage), read_world())
+
+
+# ─────────────────────────────── aliases ───────────────────────────────────
+
+BUILTIN_ALIASES = {
+    "vscode": "app-editors/vscode", "code": "app-editors/vscode",
+    "vscodium": "app-editors/vscodium", "codium": "app-editors/vscodium",
+    "chrome": "www-client/google-chrome", "googlechrome": "www-client/google-chrome",
+    "obs": "media-video/obs-studio", "telegram": "net-im/telegram-desktop",
+    "tg": "net-im/telegram-desktop", "discord": "net-im/discord",
+    "steam": "games-util/steam-launcher", "spotify": "media-sound/spotify",
+    "nvim": "app-editors/neovim", "rg": "sys-apps/ripgrep", "fd": "sys-apps/fd",
+    "bat": "sys-apps/bat", "btop": "sys-process/btop", "htop": "sys-process/htop",
+    "node": "net-libs/nodejs", "nodejs": "net-libs/nodejs", "npm": "net-libs/nodejs",
+    "python": "dev-lang/python", "python3": "dev-lang/python",
+    "office": "app-office/libreoffice", "docker": "app-containers/docker",
+    "ytdlp": "net-misc/yt-dlp", "youtubedl": "net-misc/yt-dlp",
+    "wine": "virtual/wine", "java": "virtual/jdk", "jdk": "virtual/jdk",
+    "qbit": "net-p2p/qbittorrent", "torrent": "net-p2p/qbittorrent",
+    "gcc": "sys-devel/gcc", "cc": "sys-devel/gcc", "make": "dev-build/make",
+    "ffprobe": "media-video/ffmpeg", "ssh": "net-misc/openssh",
+    "pip": "dev-python/pip", "7z": "app-arch/7zip", "7zip": "app-arch/7zip",
+    "unrar": "app-arch/unrar", "nmtui": "net-misc/networkmanager",
+    "flatpak": "sys-apps/flatpak", "neofetch": "app-misc/neofetch",
+}
+
+
+def load_aliases():
+    al = {norm(k): v for k, v in BUILTIN_ALIASES.items()}
+    for fn in sorted(glob.glob(os.path.join(ALIAS_DIR, "*.conf"))):
+        try:
+            with open(fn) as f:
+                for line in f:
+                    line = line.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = re.split(r"\s*[=\s]\s*", line, maxsplit=1)
+                    if len(parts) == 2:
+                        al[norm(parts[0])] = parts[1].strip()
+        except OSError:
+            pass
+    for k, v in read_json(LEARNED, {}).items():
+        al[norm(k)] = v
+    return al
+
+
+# ─────────────────────────────── resolver ──────────────────────────────────
+
+# query words → (replacement variants, category hints)
+SYNONYMS = [
+    ("windowmanager", ["wm", ""], ["gui-wm", "x11-wm"]),
+    ("waylandcompositor", ["wc", "wm", ""], ["gui-wm"]),
+    ("compositor", ["wc", "wm", ""], ["gui-wm", "x11-wm"]),
+    ("terminalemulator", ["term", ""], ["x11-terms", "gui-apps"]),
+    ("terminal", ["term", ""], ["x11-terms", "gui-apps"]),
+    ("webbrowser", [""], ["www-client"]),
+    ("browser", [""], ["www-client"]),
+    ("texteditor", [""], ["app-editors"]),
+    ("editor", [""], ["app-editors"]),
+    ("musicplayer", [""], ["media-sound"]),
+    ("videoplayer", [""], ["media-video"]),
+    ("player", [""], ["media-video", "media-sound"]),
+    ("launcher", [""], ["gui-apps", "x11-misc"]),
+    ("font", [""], ["media-fonts"]),
+    ("fonts", [""], ["media-fonts"]),
+    ("desktop", [""], []),
+    ("app", [""], []),
+]
+# also short hint words that may stay as part of the name
+HINT_TOKENS = {"wm": ["gui-wm", "x11-wm"], "wc": ["gui-wm"], "term": ["x11-terms"]}
+
+JUNK_CAT_RE = re.compile(r"^(dev-(python|perl|ruby|lua|php|haskell|ml|java|dotnet|go|rust|lisp|tex|R)|"
+                         r"acct-user|acct-group|virtual|perl-core|sec-keys|java-virtuals)$")
+JUNK_PN_RE = re.compile(r"(-doc|-data|-libs?|-headers|-common|-bindings)$")
+
+
+def query_variants(q):
+    """Return (set of normalized variants, category hints)."""
+    base = norm(q)
+    variants = {base}
+    hints = set()
+    for word, reps, cats in SYNONYMS:
+        new = set()
+        for v in variants:
+            if word in v:
+                hints.update(cats)
+                for r in reps:
+                    nv = v.replace(word, r)
+                    if nv:
+                        new.add(nv)
+        variants |= new
+    for tok, cats in HINT_TOKENS.items():
+        if base.endswith(tok):
+            hints.update(cats)
+    return variants, hints
+
+
+def osa_distance(a, b):
+    """Damerau-Levenshtein (optimal string alignment)."""
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return max(la, lb)
+    prev2 = None
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[lb]
+
+
+def jaro_winkler(a, b):
+    if a == b:
+        return 1.0
+    la, lb = len(a), len(b)
+    if not la or not lb:
+        return 0.0
+    md = max(la, lb) // 2 - 1
+    am, bm = [False] * la, [False] * lb
+    m = 0
+    for i in range(la):
+        for j in range(max(0, i - md), min(lb, i + md + 1)):
+            if not bm[j] and a[i] == b[j]:
+                am[i] = bm[j] = True
+                m += 1
+                break
+    if not m:
+        return 0.0
+    t, k = 0, 0
+    for i in range(la):
+        if am[i]:
+            while not bm[k]:
+                k += 1
+            if a[i] != b[k]:
+                t += 1
+            k += 1
+    jaro = (m / la + m / lb + (m - t / 2) / m) / 3
+    p = 0
+    for x, y in zip(a[:4], b[:4]):
+        if x != y:
+            break
+        p += 1
+    return jaro + p * 0.1 * (1 - jaro)
+
+
+def trigrams(s):
+    s = f"  {s} "
+    return {s[i:i + 3] for i in range(len(s) - 2)}
+
+
+def similarity(q, name):
+    if not q or not name:
+        return 0.0
+    dl = 1 - osa_distance(q, name) / max(len(q), len(name))
+    jw = jaro_winkler(q, name)
+    tq, tn = trigrams(q), trigrams(name)
+    tri = len(tq & tn) / len(tq | tn)
+    return 0.40 * jw + 0.35 * dl + 0.25 * tri
+
+
+class Match:
+    def __init__(self, entry, score, stage, note=""):
+        self.e = entry
+        self.score = score
+        self.stage = stage
+        self.note = note
+
+    @property
+    def cp(self):
+        return self.e["cp"]
+
+
+def junk(e, q):
+    if e["cat"].split("-")[-1] in q:     # "python ..." in the query → dev-python is fine
+        return False
+    return bool(JUNK_CAT_RE.match(e["cat"]) or JUNK_PN_RE.search(e["pn"]))
+
+
+def bonus(e, idx, hints):
+    b = 0.0
+    if e["cp"] in idx.binary:
+        b += 0.05
+    if e.get("stable"):
+        b += 0.03
+    if "gentoo" in e["repos"]:
+        b += 0.03
+    if hints and e["cat"] in hints:
+        b += 0.08
+    if not e.get("visible", True):
+        b -= 0.04
+    return b
+
+
+class Resolution:
+    """kind: exact | confirm | choose | none"""
+
+    def __init__(self, kind, matches, query, atom_suffix=""):
+        self.kind = kind
+        self.matches = matches
+        self.query = query
+        self.suffix = atom_suffix
+
+
+def split_version(q):
+    """'python@3.13' -> ('python', ':3.13'), 'firefox=128' -> ('firefox', '=128')"""
+    if "@" in q and not q.startswith("@"):
+        name, slot = q.rsplit("@", 1)
+        return name, ":" + slot
+    m = re.match(r"^([^=<>]+?)=([\d][\w.*-]*)$", q)
+    if m:
+        return m.group(1), "=" + m.group(2)
+    return q, ""
+
+
+def resolve(query, idx, aliases=None, only_installed=False):
+    aliases = aliases or {}
+    name, suffix = split_version(query.strip())
+    pool = [e for e in idx.entries if e["cp"] in idx.installed] if only_installed else idx.entries
+
+    def ok(e):
+        return (not only_installed) or e["cp"] in idx.installed
+
+    # 1. exact atom cat/pn
+    if "/" in name:
+        e = idx.by_cp.get(name.lower())
+        if e and ok(e):
+            return Resolution("exact", [Match(e, 1.0, 1)], query, suffix)
+        name = name.split("/", 1)[1]
+
+    ql = name.lower()
+    qn = norm(name)
+    variants, hints = query_variants(name)
+
+    # 2. exact package name
+    hits = [e for e in idx.by_pn.get(ql, []) if ok(e)]
+    if hits:
+        good = [e for e in hits if not junk(e, qn)]
+        if len(hits) == 1 or len(good) == 1:
+            e = hits[0] if len(hits) == 1 else good[0]
+            return Resolution("exact", [Match(e, 1.0, 2)], query, suffix)
+        ms = sorted((Match(e, 0.99 + bonus(e, idx, hints) - (0.2 if junk(e, qn) else 0), 2) for e in hits),
+                    key=lambda m: -m.score)
+        return Resolution("choose", ms, query, suffix)
+
+    # 3/4. aliases (curated, user, learned) incl. command names
+    if qn in aliases:
+        target = aliases[qn]
+        e = idx.by_cp.get(target)
+        if e and ok(e):
+            return Resolution("exact", [Match(e, 1.0, 3, T(f"псевдоним «{name}»", f"alias «{name}»"))], query, suffix)
+
+    # 5. normalized forms (separators, synonyms)
+    nh = []
+    for v in variants:
+        nh += [e for e in idx.by_norm.get(v, []) if ok(e)]
+    for e in pool:  # upstream repo names from metadata.xml
+        if any(norm(u) in variants for u in e.get("upstream", [])):
+            nh.append(e)
+    uniq = {e["cp"]: e for e in nh}
+    if uniq:
+        cands = list(uniq.values())
+        good = [e for e in cands if not junk(e, qn)]
+        if len(cands) == 1 or len(good) == 1:
+            e = cands[0] if len(cands) == 1 else good[0]
+            return Resolution("exact", [Match(e, 0.97, 5, f"«{name}»")], query, suffix)
+        ms = sorted((Match(e, 0.95 + bonus(e, idx, hints), 5) for e in cands), key=lambda m: -m.score)
+        return Resolution("choose", ms[:8], query, suffix)
+
+    # short queries: never fuzzy
+    if len(qn) <= 3:
+        return Resolution("none", fuzzy_candidates(qn, variants, hints, pool, idx, minlen=0)[:5], query, suffix)
+
+    # 6/7. prefix/substring + fuzzy
+    ms = fuzzy_candidates(qn, variants, hints, pool, idx)
+    # 8. description search
+    if not ms or ms[0].score < 0.6:
+        ms = (ms + desc_search(name, pool, idx, hints))
+        ms.sort(key=lambda m: -m.score)
+    if not ms:
+        return Resolution("none", [], query, suffix)
+    top = ms[0]
+    second = ms[1].score if len(ms) > 1 else 0
+    if top.stage in (6, 7) and top.score >= CONF["fuzzy_threshold"] and top.score - second >= CONF["fuzzy_margin"]:
+        return Resolution("confirm", ms[:5], query, suffix)
+    return Resolution("choose", ms[:8], query, suffix)
+
+
+def fuzzy_candidates(qn, variants, hints, pool, idx, minlen=4):
+    res = []
+    for e in pool:
+        n = e["norm"]
+        if junk(e, qn):
+            pen = 0.12
+        else:
+            pen = 0.0
+        best, stage = 0.0, 7
+        for v in variants:
+            if len(v) < 2:
+                continue
+            # prefix / substring with length ratio
+            ratio = min(len(n), len(v)) / max(len(n), len(v))
+            if (n.startswith(v) and ratio >= 0.6) or (v.startswith(n) and ratio >= 0.85):
+                s = 0.80 + 0.15 * min(len(n), len(v)) / max(len(n), len(v))
+                if s > best:
+                    best, stage = s, 6
+                continue
+            if v in n and len(v) >= 4 and len(v) / len(n) >= 0.5:
+                s = 0.72 + 0.15 * len(v) / len(n)
+                if s > best:
+                    best, stage = s, 6
+                continue
+            if len(v) < minlen:
+                continue
+            if abs(len(v) - len(n)) > max(3, len(v) // 2):
+                continue
+            if v[:2] != n[:2] and not (trigrams(v) & trigrams(n)) - {"  " + v[0], "  " + n[0]}:
+                continue          # cheap prefilter: nothing in common
+            s = similarity(v, n)
+            if v[0] != n[0]:
+                s -= 0.08
+            if s > best:
+                best, stage = s, 7
+        if best >= 0.55:
+            res.append(Match(e, best + bonus(e, idx, hints) - pen, stage))
+    res.sort(key=lambda m: -m.score)
+    return res[:20]
+
+
+def desc_search(text, pool, idx, hints):
+    toks = [t for t in re.split(r"\W+", text.lower()) if len(t) > 2]
+    if not toks:
+        return []
+    res = []
+    for e in pool:
+        d = (e["desc"] + " " + e["pn"]).lower()
+        hit = sum(1 for t in toks if t in d)
+        if hit == len(toks):
+            res.append(Match(e, 0.45 + 0.1 * hit / len(toks) + bonus(e, idx, hints), 8))
+    res.sort(key=lambda m: -m.score)
+    return res[:10]
+
+
+# ─────────────────────────── presentation ──────────────────────────────────
+
+def pkg_badges(e, idx):
+    b = []
+    if e["cp"] in idx.installed:
+        b.append(ui.badge("inst"))
+    b.append(ui.badge("bin") if e["cp"] in idx.binary else ui.badge("src"))
+    if "gentoo" not in e["repos"]:
+        b.append(ui.badge("ovl"))
+    return " ".join(b)
+
+
+def pkg_line(e, idx, with_desc=True):
+    cat, pn = e["cp"].split("/", 1)
+    repo = "" if "gentoo" in e["repos"] else ui.magenta("::" + e["repos"][0])
+    kw = "" if e.get("stable") else ui.yellow(" ~")
+    s = f"{ui.dim(cat + '/')}{ui.bold(pn)}{repo}{kw}"
+    if with_desc and e["desc"]:
+        s += "  " + ui.dim(e["desc"])
+    return s
+
+
+def choose_match(res, idx):
+    """Return chosen Match or None, with UI."""
+    if res.kind == "exact":
+        m = res.matches[0]
+        if CONF["confirm_exact"] and not ui.ask(T(f"Это {m.cp}?", f"Is it {m.cp}?")):
+            return None
+        return m
+    if res.kind == "confirm":
+        m = res.matches[0]
+        ui.out(T(f"   {ui.yellow('?')} «{res.query}» не найден точно. Похоже на:", f"   {ui.yellow('?')} «{res.query}» not found exactly. Did you mean:"))
+        ui.out(f"     {pkg_badges(m.e, idx)}  {pkg_line(m.e, idx)}")
+        if ui.yes:
+            ui.err(T(f"«{res.query}»: неточное совпадение, в режиме --yes не ставлю. "
+                   f"Укажи точно: toe install {m.cp}", f"«{res.query}»: inexact match, not installing in --yes mode. "
+                   f"Be explicit: toe install {m.cp}"))
+            return None
+        if ui.ask(T("Это он?", "Is this it?"), True):
+            learn(res.query, m.cp)
+            return m
+        res = Resolution("choose", res.matches, res.query, res.suffix)
+    if res.kind == "choose" and res.matches:
+        if ui.yes:
+            ui.err(T(f"«{res.query}»: несколько вариантов ({', '.join(m.cp for m in res.matches[:4])}). Укажи точно.", f"«{res.query}»: several candidates ({', '.join(m.cp for m in res.matches[:4])}). Be explicit."))
+            return None
+        items = [f"{pkg_badges(m.e, idx)}  {pkg_line(m.e, idx, False)}" for m in res.matches]
+        details = [m.e["desc"] or m.e["homepage"] for m in res.matches]
+        i = ui.pick(T(f"Что из этого «{res.query}»?", f"Which one is «{res.query}»?"), items, details)
+        if i is None:
+            ui.step(T("пропускаю", "skipping"))
+            return None
+        learn(res.query, res.matches[i].cp)
+        return res.matches[i]
+    return None
+
+
+def learn(query, cp):
+    if norm(query) == norm(cp.split("/")[-1]) or not is_root():
+        return
+    d = read_json(LEARNED, {})
+    d[query.lower()] = cp
+    try:
+        write_json(LEARNED, d)
+    except OSError:
+        pass
+
+
+# ──────────────────────── emerge output parsing ────────────────────────────
+
+MERGE_LINE_RE = re.compile(r"^\[(?P<kind>binary|ebuild|nomerge|blocks|uninstall)\s+(?P<flags>[^\]]*)\]\s+(?P<cpv>\S+)(?P<rest>.*)$")
+AUTOUNMASK_HDR = {
+    "keyword": "The following keyword changes are necessary to proceed:",
+    "use": "The following USE changes are necessary to proceed:",
+    "license": "The following license changes are necessary to proceed:",
+    "mask": "The following mask changes are necessary to proceed:",
+}
+ATOM_LINE_RE = re.compile(r"^[<>=~]*[\w+][\w+.-]*/[\w+][\w+.*-]*(::[\w-]+)?(\s+.*)?$")
+IGNORED_BIN_HDR = "The following binary packages have been ignored due to non matching USE:"
+
+
+class Plan:
+    def __init__(self):
+        self.items = []        # dicts: kind, flags, cpv, cp, old
+        self.changes = {}      # kind -> [lines incl. comments]
+        self.ignored_bin = []  # (cpv, flags)
+        self.blockers = []
+        self.raw = ""
+
+
+CHANGE_USE_RE = re.compile(r"^-\s+(\S+?)(?:::\S+)?\s+\(Change USE:\s*([^)]*)\)")
+NOISE_RE = re.compile(r"news items? need reading|Use eselect news read|These are the packages that would be merged|"
+                      r"^Calculating dependencies|^Dependency resolution took|^\s*$")
+
+
+def use_hints(out):
+    """emerge sometimes suggests USE changes only as '- cat/pkg-1.0::repo (Change USE: +gtk3)'
+    inside an error block. Take the first alternative of every such block."""
+    hints, in_block = [], False
+    for raw in out.splitlines():
+        s = raw.strip()
+        if s.startswith("!!! One of the following packages is required"):
+            in_block = True
+            continue
+        m = CHANGE_USE_RE.match(s)
+        if m and in_block:
+            flags = [f[1:] if f.startswith("+") else f for f in re.findall(r"[+-][\w+.@-]+", m.group(2))]
+            if flags:
+                hints.append(f"{cpv_to_cp(m.group(1))} {' '.join(flags)}")
+            in_block = False          # only the first alternative
+    return list(dict.fromkeys(hints))
+
+
+def show_emerge_error(out, limit=25):
+    lines = [l for l in out.splitlines() if not NOISE_RE.search(l.strip())]
+    for ln in lines[-limit:]:
+        ui.out("   " + ui.dim(ln))
+
+
+def parse_pretend(out):
+    plan = Plan()
+    plan.raw = out
+    lines = out.splitlines()
+    section = None
+    for i, raw in enumerate(lines):
+        line = raw.rstrip()
+        s = line.strip()
+        m = MERGE_LINE_RE.match(s)
+        if m:
+            section = None
+            kind = m.group("kind")
+            cpv = m.group("cpv")
+            old = re.search(r"\[([^\]]+)\]", m.group("rest"))
+            item = {"kind": kind, "flags": m.group("flags"), "cpv": cpv.split("::")[0],
+                    "cp": cpv_to_cp(cpv), "repo": cpv.split("::")[1] if "::" in cpv else "",
+                    "old": old.group(1).split("::")[0] if old else ""}
+            if kind == "blocks":
+                plan.blockers.append(s)
+            else:
+                plan.items.append(item)
+            continue
+        hdr = next((k for k, h in AUTOUNMASK_HDR.items() if s == h), None)
+        if hdr:
+            section = hdr
+            plan.changes.setdefault(hdr, [])
+            continue
+        if s == IGNORED_BIN_HDR.strip() or s.endswith(IGNORED_BIN_HDR):
+            section = "ignored"
+            continue
+        if section:
+            if not s:
+                # blank line ends a section only if the next non-blank isn't an entry
+                nxt = next((l.strip() for l in lines[i + 1:] if l.strip()), "")
+                if not (nxt.startswith("#") or ATOM_LINE_RE.match(nxt)):
+                    section = None
+                continue
+            if s.startswith("(see") or s.startswith("Use --autounmask") or s.startswith("!!!") \
+                    or s.startswith("NOTE:") or s.startswith("*"):
+                if s.startswith("!!!") or s.startswith("Use --"):
+                    section = None
+                continue
+            if section == "ignored":
+                if s.startswith("="):
+                    parts = s.split(None, 1)
+                    plan.ignored_bin.append((parts[0][1:], parts[1] if len(parts) > 1 else ""))
+                continue
+            if s.startswith("#") or ATOM_LINE_RE.match(s):
+                plan.changes[section].append(s)
+            else:
+                section = None
+    hints = [h for h in use_hints(out) if h not in plan.changes.get("use", [])]
+    if hints:
+        plan.changes.setdefault("use", []).extend(["# suggested by emerge"] + hints)
+    return plan
+
+
+def prebuilt(it):
+    """A plan item that compiles nothing: from the binhost, or a -bin ebuild (upstream's binary)."""
+    return it["kind"] == "binary" or it["cp"].endswith("-bin")
+
+
+def plan_rows(plan, idx):
+    rows = []
+    for it in plan.items:
+        if it["kind"] in ("nomerge",):
+            continue
+        f = it["flags"]
+        if "N" in f:
+            st = ui.badge("new")
+        elif "U" in f:
+            st = ui.badge("upd")
+        elif "D" in f:
+            st = ui.badge("dn")
+        elif it["kind"] == "uninstall":
+            st = ui.badge("del")
+        else:
+            st = ui.badge("re")
+        src = ui.badge("bin") if prebuilt(it) else ui.badge("src")
+        cat, pn = it["cp"].split("/", 1) if "/" in it["cp"] else ("", it["cp"])
+        ver = cpv_version(it["cpv"])
+        old = (cpv_version(it["old"]) or it["old"]) if it["old"] else ""
+        verstr = (ui.dim(old) + ui.dim(f" {ui.sym['arrow']} ") if old else "") + ui.green(ver)
+        repo = ui.magenta("::" + it["repo"]) if it["repo"] and it["repo"] != "gentoo" else ""
+        rows.append([st, src, ui.dim(cat + "/") + ui.bold(pn) + repo, verstr])
+    return rows
+
+
+def build_time_hint(cps):
+    if not shutil.which("qlop"):
+        return {}
+    res = {}
+    for cp in cps:
+        rc, out = run(["qlop", "-a", "-C", "-q", cp], capture=True)
+        if rc == 0 and out.strip():
+            res[cp] = out.strip().splitlines()[-1].split(":", 1)[-1].strip()
+    return res
+
+
+# ────────────────────────── /etc/portage writes ────────────────────────────
+
+CHANGE_DIRS = {"keyword": "package.accept_keywords", "use": "package.use", "license": "package.license"}
+
+
+def write_portage_change(kind, lines, tag):
+    """Write lines into /etc/portage/package.*; returns journal record."""
+    base = os.path.join(PORTAGE_ETC, CHANGE_DIRS[kind])
+    stamp = _dt.datetime.now().isoformat(timespec="seconds")
+    header = f"# added by toe {stamp}: {tag}\n"
+    body = header + "\n".join(lines) + "\n"
+    if os.path.isfile(base):
+        marker_b, marker_e = f"# >>> toe:{tag}:{stamp}", f"# <<< toe:{tag}:{stamp}"
+        with open(base, "a") as f:
+            f.write(f"\n{marker_b}\n{body}{marker_e}\n")
+        return {"path": base, "mode": "block", "begin": marker_b, "end": marker_e}
+    os.makedirs(base, exist_ok=True)
+    safe = re.sub(r"[^\w.-]+", "_", tag)[:60]
+    fn = os.path.join(base, "zz-toe-" + safe)
+    mode = "append" if os.path.exists(fn) else "create"
+    with open(fn, "a") as f:
+        f.write(body)
+    return {"path": fn, "mode": mode, "text": body}
+
+
+def journal_add(cmd, records, packages):
+    j = read_json(JOURNAL, [])
+    j.append({"time": time.time(), "cmd": cmd, "records": records, "packages": packages})
+    write_json(JOURNAL, j)
+
+
+def revert_record(r):
+    try:
+        if r["mode"] == "create":
+            os.remove(r["path"])
+        elif r["mode"] == "append":
+            with open(r["path"]) as f:
+                txt = f.read()
+            txt = txt.replace(r["text"], "")
+            if txt.strip():
+                with open(r["path"], "w") as f:
+                    f.write(txt)
+            else:
+                os.remove(r["path"])
+        elif r["mode"] == "block":
+            with open(r["path"]) as f:
+                txt = f.read()
+            pat = re.compile(r"\n?" + re.escape(r["begin"]) + r".*?" + re.escape(r["end"]) + r"\n", re.S)
+            with open(r["path"], "w") as f:
+                f.write(pat.sub("", txt))
+        return True
+    except OSError as e:
+        ui.warn(T(f"не смогла откатить {r['path']}: {e}", f"could not revert {r['path']}: {e}"))
+        return False
+
+
+# ───────────────────────────── system checks ───────────────────────────────
+
+def sync_age_days():
+    for p in ("/var/db/repos/gentoo/metadata/timestamp.chk", "/var/db/repos/gentoo/metadata/timestamp.x"):
+        if os.path.exists(p):
+            return (time.time() - os.path.getmtime(p)) / 86400
+    return None
+
+
+def take_snapshot(note):
+    mode = CONF["snapshot"]
+    if mode == "never" or not os.access(SNAPSHOT_BIN, os.X_OK):
+        return
+    ui.step(T(f"снимок btrfs: {ui.dim(note)}", f"btrfs snapshot: {ui.dim(note)}"))
+    run([SNAPSHOT_BIN, f"toe: {note}"], capture=True)
+
+
+def after_ops():
+    if shutil.which("eselect"):
+        rc, out = run(["eselect", "news", "count", "new"], capture=True)
+        if rc == 0 and out.strip().isdigit() and int(out.strip()) > 0:
+            ui.warn(T(f"непрочитанных новостей Gentoo: {out.strip()} {ui.dim('→ eselect news read')}", f"unread Gentoo news: {out.strip()} {ui.dim('→ eselect news read')}"))
+    cfgs = []
+    for root in ("/etc",):
+        for dp, _dn, fns in os.walk(root):
+            cfgs += [os.path.join(dp, f) for f in fns if f.startswith("._cfg")]
+            if len(cfgs) > 50:
+                break
+    if cfgs:
+        ui.warn(T(f"обновлённых конфигов ждут слияния: {len(cfgs)} {ui.dim('→ dispatch-conf')}", f"config updates waiting to be merged: {len(cfgs)} {ui.dim('→ dispatch-conf')}"))
+    reg = "/var/lib/portage/preserved_libs_registry"
+    try:
+        if os.path.getsize(reg) > 2:
+            with open(reg) as f:
+                if json.load(f):
+                    ui.warn(T(f"есть сохранённые старые библиотеки {ui.dim('→ toe fix')}", f"preserved old libraries present {ui.dim('→ toe fix')}"))
+    except (OSError, ValueError):
+        pass
+
+
+# ────────────────────────── emerge with progress ───────────────────────────
+# Reads emerge's own ">>> Emerging (i of N) …" lines for the big picture and the
+# package's build.log for the details: ebuild phase + [n/m] (ninja) or [ 42%] (cmake).
+
+PHASE_MARKERS = [
+    (">>> Unpacking source", "unpack"), (">>> Preparing source", "prepare"),
+    (">>> Configuring source", "configure"), (">>> Compiling source", "compile"),
+    (">>> Source compiled", "compiled"), (">>> Test phase", "test"),
+    (">>> Install ", "install"), (">>> Completed installing", "installed"),
+]
+PHASE_WEIGHT = {"fetch": 0.02, "unpack": 0.05, "prepare": 0.08, "configure": 0.12, "compile": 0.18,
+                "compiled": 0.86, "test": 0.86, "install": 0.88, "installed": 0.93, "merge": 0.95}
+PHASE_NAME = {"fetch": ("загрузка", "fetch"), "unpack": ("распаковка", "unpack"),
+              "prepare": ("подготовка", "prepare"), "configure": ("configure", "configure"),
+              "compile": ("сборка", "compile"), "compiled": ("сборка", "compile"),
+              "test": ("тесты", "test"), "install": ("установка", "install"),
+              "installed": ("установка", "install"), "merge": ("слияние", "merge")}
+NINJA_RE = re.compile(r"\[(\d+)/(\d+)\]")
+CMAKE_RE = re.compile(r"\[\s*(\d{1,3})%\]")
+EMERGE_EV_RE = re.compile(r">>> (Emerging binary|Emerging|Installing|Completed) \((\d+) of (\d+)\) (\S+)")
+FAILED_RE = re.compile(r">>> Failed to (?:emerge|install) (\S+)")
+
+
+def portage_tmpdir():
+    if os.environ.get("PORTAGE_TMPDIR"):
+        return os.environ["PORTAGE_TMPDIR"]
+    try:
+        import portage
+        return portage.settings.get("PORTAGE_TMPDIR", "/var/tmp")
+    except Exception:
+        return "/var/tmp"
+
+
+class Job:
+    def __init__(self, cpv, binary):
+        self.cpv = cpv.split("::")[0]
+        self.repo = cpv.split("::")[1] if "::" in cpv else ""
+        self.binary = binary
+        self.phase = "fetch"
+        self.n = self.m = None
+        self.pct = None
+        self.t0 = time.time()
+        cat, pf = self.cpv.split("/", 1) if "/" in self.cpv else ("", self.cpv)
+        self.log = os.path.join(portage_tmpdir(), "portage", cat, pf, "temp", "build.log")
+
+    def poll(self):
+        """update phase and counters from the tail of build.log"""
+        if self.binary or self.phase == "merge":
+            return
+        try:
+            with open(self.log, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 16384))
+                tail = f.read().decode("utf-8", "replace")
+        except OSError:
+            return
+        # the phase whose marker appears last in the log is the current one
+        best = -1
+        for marker, ph in PHASE_MARKERS:
+            pos = tail.rfind(marker)
+            if pos > best:
+                best, cur = pos, ph
+        if best >= 0:
+            self.phase = cur
+        if self.phase == "compile":
+            m = None
+            for m in NINJA_RE.finditer(tail):
+                pass
+            if m and int(m.group(2)) > 0:
+                self.n, self.m = int(m.group(1)), int(m.group(2))
+            else:
+                c = None
+                for c in CMAKE_RE.finditer(tail):
+                    pass
+                if c:
+                    self.pct = int(c.group(1))
+
+    def frac(self):
+        if self.binary:
+            return 0.9 if self.phase == "merge" else None
+        base = PHASE_WEIGHT.get(self.phase, 0.1)
+        if self.phase == "compile":
+            if self.m:
+                return 0.18 + 0.68 * self.n / self.m
+            if self.pct is not None:
+                return 0.18 + 0.68 * self.pct / 100
+            return None            # compile progress unknown → bouncing bar
+        return base
+
+    def detail(self):
+        name = T(*PHASE_NAME.get(self.phase, (self.phase, self.phase)))
+        if self.binary:
+            return T("скачиваю бинарь", "fetching binary") if self.phase != "merge" else name
+        if self.phase == "compile" and self.m:
+            return f"{name} [{self.n}/{self.m}]"
+        if self.phase == "compile" and self.pct is not None:
+            return f"{name} [{self.pct:3d}%]"
+        return name
+
+
+def fmt_time(sec):
+    sec = int(max(0, sec))
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def emerge_live(args):
+    """Run emerge and draw the 6a timeline: service line per package,
+    wget bar under running ones, total bar + eta at the bottom."""
+    cmd = ["emerge"] + args
+    if CONF["show_command"] or ui.verbose:
+        ui.out(ui.dim("$ " + " ".join(cmd)))
+    log("run: " + " ".join(cmd))
+    if ui.verbose:
+        return subprocess.call(cmd)
+    env = dict(os.environ, NOCOLOR="true")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+    import select
+    live = Live(ui)
+    jobs = {}                 # cpv -> Job
+    done = 0
+    total = 0
+    failed = []
+    tail = []
+    t0 = time.time()
+    tick = 0
+    buf = b""
+    fd = p.stdout.fileno()
+
+    def verb(job):
+        return T("Скачиваю", "Fetching") if job.binary else T("Собираю", "Building")
+
+    def region():
+        lines = []
+        for j in jobs.values():
+            lines.append(ui.rail_prefix() + " " + ui.service(f"{verb(j)} {j.cpv}", "run", tick))
+            fr = j.frac()
+            if fr is None:
+                b = ui.bar(0, 28, indeterminate_pos=tick)
+                pc = "    "
+            else:
+                b = ui.bar(fr, 28)
+                pc = f"{int(fr * 100):3d}%"
+            el = fmt_time(time.time() - j.t0)
+            lines.append(ui.rail_prefix() + "     " + b + " " + pc + "  " + ui.dim(f"{j.detail()}  {el}"))
+        if total:
+            part = sum((j.frac() or 0.5) for j in jobs.values())
+            ov = min(1.0, (done + part) / total)
+            el = time.time() - t0
+            eta = (el / ov * (1 - ov)) if ov > 0.03 else None
+            lines.append(ui.rail_prefix())
+            lines.append(f"{ui.purple(ui.sym['tee'])}  {T('всего', 'total')} " + ui.bar(ov, 34, ui.lavender) +
+                         " " + ui.bold(f"{int(ov * 100):3d}%"))
+            info = f"{done}/{total} {ui.sym['dot']} {T('прошло', 'elapsed')} {fmt_time(el)}"
+            if eta is not None:
+                info += f" {ui.sym['dot']} eta {fmt_time(eta)}"
+            lines.append(ui.rail_prefix() + "  " + ui.dim(info))
+        return lines
+
+    def handle(line):
+        nonlocal done, total
+        tail.append(line)
+        del tail[:-80]
+        m = EMERGE_EV_RE.search(line)
+        if m:
+            what, total = m.group(1), int(m.group(3))
+            cpv = m.group(4).split("::")[0]
+            if what in ("Emerging", "Emerging binary"):
+                jobs[cpv] = Job(m.group(4), what == "Emerging binary")
+            elif what == "Installing":
+                j = jobs.get(cpv) or jobs.setdefault(cpv, Job(m.group(4), False))
+                j.phase = "merge"
+            elif what == "Completed":
+                j = jobs.pop(cpv, None) or Job(m.group(4), False)
+                done += 1
+                live.above(ui.service(f"{verb(j)} {cpv}", "ok"))
+            return
+        f = FAILED_RE.search(line)
+        if f:
+            cpv = f.group(1).split("::")[0].rstrip(",")
+            j = jobs.pop(cpv, None) or Job(cpv, False)
+            failed.append(j)
+            live.above(ui.service(f"{verb(j)} {cpv}", "fail"))
+
+    try:
+        while True:
+            r, _, _ = select.select([fd], [], [], 0.12)
+            if r:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    handle(raw.decode("utf-8", "replace").rstrip("\r"))
+            tick += 1
+            for j in jobs.values():
+                if tick % 4 == 0:
+                    j.poll()
+            live.show(region())
+    except KeyboardInterrupt:
+        p.send_signal(signal.SIGINT)
+    if buf:
+        handle(buf.decode("utf-8", "replace"))
+    rc = p.wait()
+    live.stop()
+
+    if rc != 0:
+        for j in list(jobs.values()):
+            failed.append(j)
+            ui.out(ui.service(f"{verb(j)} {j.cpv}", "fail"))
+        report_failure(failed, tail)
+    return rc
+
+
+def report_failure(failed, tail):
+    ui.out()
+    if not failed:
+        ui.err(T("emerge завершился с ошибкой", "emerge failed"))
+        for ln in [l for l in tail if l.strip()][-15:]:
+            ui.out("  " + ui.dim(ln))
+        return
+    for j in failed:
+        where = j.detail()
+        ui.err(T(f"{j.cpv}: ошибка на этапе {where}", f"{j.cpv}: failed during {where}"))
+        errs = []
+        try:
+            with open(j.log, errors="replace") as f:
+                lines = f.readlines()[-400:]
+            errs = [l.rstrip() for l in lines if re.search(r"\berror\b|Error |undefined reference|No such file", l)]
+        except OSError:
+            lines = []
+        for e in (errs[-4:] or [l.rstrip() for l in lines[-6:]]):
+            ui.out("    " + ui.dim(truncate_visible(e.strip(), ui.width - 10)))
+        if os.path.exists(j.log):
+            ui.warn(T("лог: ", "log: ") + ui.dim(j.log))
+        ui.warn(T("попробуй: ", "try: ") + ui.bold(f"toe install ={j.cpv} --source --reinstall") +
+                ui.dim("  (MAKEOPTS=-j1 " + T("если не хватает памяти", "if you ran out of RAM") + ")"))
+    if os.access(SNAPSHOT_BIN, os.X_OK):
+        ui.warn(T("если что-то сломалось — есть снимок: ", "if something broke there is a snapshot: ") + ui.bold("rollback"))
+
+
+# ─────────────────────────────── commands ──────────────────────────────────
+
+INSTALL_FLAGS = ["--verbose", "--noreplace", "--getbinpkg", "--binpkg-respect-use=y"]
+CRITICAL = {"sys-libs/glibc", "sys-devel/gcc", "sys-apps/portage", "app-shells/bash", "sys-apps/baselayout",
+            "sys-apps/coreutils", "dev-lang/python", "sys-libs/musl", "sys-apps/openrc", "sys-apps/systemd",
+            "sys-devel/binutils", "sys-apps/util-linux", "sys-libs/ncurses", "sys-libs/zlib", "sys-kernel/linux-firmware"}
+
+
+def banner(sub, detail=""):
+    ui.start(sub, detail)
+
+
+def check_sync():
+    age = sync_age_days()
+    if age is not None and age > CONF["sync_max_age_days"]:
+        ui.warn(T(f"дерево не синхронизировалось {int(age)} дн.", f"tree not synced for {int(age)} days"))
+        if ui.ask(T("Синхронизировать сейчас?", "Sync now?"), True):
+            run(["emaint", "sync", "-a"])
+            return True
+    return False
+
+
+def cmd_install(a, argv):
+    ensure_root(argv)
+    banner("install", " ".join(a.packages))
+    if not a.no_sync_check and check_sync():
+        pass
+    idx = load_index()
+    aliases = load_aliases()
+    ui.head(T("Ищу пакеты", "Looking up packages"))
+    atoms, picked = [], []
+    flatpak_wanted = []
+    for q in a.packages:
+        if q.startswith("@"):
+            atoms.append(q)
+            continue
+        if re.match(r"^[<>=~]", q):
+            atoms.append(q)
+            continue
+        res = resolve(q, idx, aliases)
+        if res.kind == "none" or not res.matches:
+            ui.out(T(f"   {ui.red(ui.sym['err'])} «{q}» не нашла в подключённых репозиториях", f"   {ui.red(ui.sym['err'])} «{q}» not found in enabled repositories"))
+            fp = flatpak_search(q) if CONF["flatpak_fallback"] != "never" else []
+            if fp:
+                ui.out(T(f"     {ui.badge('flat')} есть на Flathub: {ui.bold(fp[0][1])} {ui.dim(fp[0][0])}", f"     {ui.badge('flat')} available on Flathub: {ui.bold(fp[0][1])} {ui.dim(fp[0][0])}"))
+                if ui.ask(T("Поставить через Flatpak?", "Install via Flatpak?"), False):
+                    flatpak_wanted.append(fp[0][0])
+            elif res.matches:
+                ui.out("     " + ui.dim(T("ближе всего: ", "closest: ") + ", ".join(m.cp for m in res.matches[:3])))
+            else:
+                ui.out("     " + ui.dim(T("поищи в оверлеях: https://gpo.zugaina.org/ → eselect repository enable <оверлей>", "search overlays: https://gpo.zugaina.org/ → eselect repository enable <overlay>")))
+            continue
+        m = choose_match(res, idx)
+        if not m:
+            continue
+        cp = m.cp
+        # X vs X-bin: whenever a prebuilt -bin variant exists, say which one compiles and ask
+        if not res.suffix:
+            cp = choose_bin_variant(cp, idx, a)
+            if cp is None:
+                ui.step(T("пропускаю", "skipping"))
+                continue
+        if cp in idx.installed and not a.reinstall and not res.suffix:
+            ui.ok(T(f"{pkg_line(idx.by_cp[cp], idx, False)} уже установлен", f"{pkg_line(idx.by_cp[cp], idx, False)} is already installed"))
+            if cp not in idx.world:
+                atoms.append(cp)   # adds to @world without rebuild thanks to --noreplace
+            continue
+        atom = cp + res.suffix if res.suffix.startswith(":") else (f"={cp}-{res.suffix[1:]}*" if res.suffix else cp)
+        atoms.append(atom)
+        picked.append(cp)
+        note = f"{ui.dim(m.note)} {ui.dim(ui.sym['arrow'])} " if m.note else ""
+        ui.ok(f"{note}{pkg_line(idx.by_cp[cp], idx, False)}  {pkg_badges(idx.by_cp[cp], idx)}")
+
+    for app in flatpak_wanted:
+        run(["flatpak", "install", "-y" if ui.yes else "--noninteractive", "flathub", app])
+    if not atoms:
+        return 0 if flatpak_wanted else 1
+
+    flags = list(INSTALL_FLAGS)
+    if a.reinstall:
+        flags.remove("--noreplace")
+    if a.bin:
+        flags.append("--getbinpkgonly")
+    if a.source:
+        flags = [f for f in flags if f != "--getbinpkg"] + ["--getbinpkg=n", "--usepkg=n"]
+    if a.oneshot:
+        flags.append("--oneshot")
+
+    records = []
+    asked_bin = False
+    for attempt in range(8):
+        if attempt == 0:
+            ui.head(T("Считаю зависимости", "Resolving dependencies"))
+        rc, out = run(["emerge", "--pretend", "--color=n"] + flags +
+                      ["--autounmask=y", "--autounmask-write=n", "--autounmask-license=y"] + atoms,
+                      capture=True)
+        plan = parse_pretend(out)
+        if plan.changes.get("mask"):
+            ui.err(T("пакет замаскирован (hardmask) — toe такое не снимает автоматически", "package is hard-masked — toe never unmasks that automatically"))
+            for ln in plan.changes["mask"]:
+                ui.out("   " + ui.dim(ln))
+            ui.out(ui.dim(T("   причину смотри в package.mask профиля/репозитория; снять можно через /etc/portage/package.unmask", "   see the reason in the profile/repo package.mask; unmask via /etc/portage/package.unmask")))
+            return 1
+        need = {k: v for k, v in plan.changes.items() if v and k in CHANGE_DIRS}
+        if plan.ignored_bin and not a.source and not asked_bin:
+            asked_bin = True
+            got = handle_ignored_bin(plan, a, " ".join(a.packages))
+            if got:
+                records += got
+                continue
+        if need:
+            show_changes(need)
+            if not ui.ask(T("Применить эти изменения в /etc/portage?", "Apply these changes to /etc/portage?"), True):
+                return 1
+            if a.dry_run or a.explain:
+                ui.step(T("dry-run: в /etc/portage ничего не пишу", "dry-run: not writing to /etc/portage"))
+                break
+            tag = "-".join(sorted({cpv_to_cp(x).split("/")[-1] for x in picked})) or "deps"
+            for kind, lines in need.items():
+                records.append(write_portage_change(kind, lines, tag))
+                ui.ok(T(f"записала {kind}: {ui.dim(records[-1]['path'])}", f"wrote {kind}: {ui.dim(records[-1]['path'])}"))
+            continue
+        if rc != 0 and not plan.items:
+            ui.err(T("emerge не смог посчитать зависимости:", "emerge could not resolve dependencies:"))
+            show_emerge_error(out, 30)
+            if records:
+                journal_add(" ".join(sys.argv), records, picked)
+                ui.out(ui.dim(T("   правки /etc/portage сохранены; откатить: toe undo", "   /etc/portage changes kept; revert with: toe undo")))
+            return 1
+        break
+
+    if plan.blockers:
+        ui.warn(T("есть блокировки (конфликтующие пакеты):", "blockers (conflicting packages):"))
+        for b in plan.blockers:
+            ui.out("     " + ui.red(b))
+
+    show_plan(plan, idx, picked)
+    if a.dry_run or a.explain:
+        ui.out(ui.dim("   $ emerge " + " ".join(flags + atoms)))
+        return 0
+    if not plan.items:
+        ui.ok(T("ставить нечего", "nothing to install"))
+        if records:
+            journal_add(" ".join(sys.argv), records, picked)
+        return 0
+    if not ui.ask(T("Поехали?", "Proceed?"), True):
+        if records and ui.ask(T("Откатить сделанные правки /etc/portage?", "Revert the /etc/portage changes?"), True):
+            for r in records:
+                revert_record(r)
+        return 1
+    if records:
+        journal_add(" ".join(sys.argv), records, picked)
+    if len(plan.items) > 3 or any(i["kind"] == "ebuild" for i in plan.items):
+        take_snapshot("install " + " ".join(a.packages))
+    ui.head(T("Устанавливаю", "Installing"))
+    rc = emerge_live(flags + ["--quiet-build=y"] + atoms)
+    if rc == 0:
+        ui.final = ui.c("1;32", T(f"установлено пакетов: {len(plan.items)}", f"{len(plan.items)} packages installed"))
+        after_ops()
+    return rc
+
+
+HEAVY = {"firefox", "chromium", "thunderbird", "libreoffice", "llvm", "clang", "rust", "qtwebengine",
+         "webkit-gtk", "gcc", "spidermonkey", "nodejs", "openjdk", "ghc", "electron", "blender", "kicad"}
+
+
+def bin_variants(cp, idx):
+    """Prebuilt '-bin' packages for CP (same category first), e.g. www-client/firefox-bin."""
+    cat, pn = cp.split("/", 1)
+    if pn.endswith("-bin"):
+        return []
+    found = [e["cp"] for e in idx.by_pn.get(pn + "-bin", [])]
+    return sorted(found, key=lambda c: (c.split("/")[0] != cat, c))
+
+
+def will_compile(cp):
+    """True when emerge would build CP from source, False when it comes from the binhost,
+    None when that can't be told (masked, blockers, ...)."""
+    rc, out = run(["emerge", "--pretend", "--nodeps", "--color=n", "--getbinpkg", "--binpkg-respect-use=y",
+                   "--autounmask=y", "--autounmask-write=n", "--autounmask-license=y", cp], capture=True)
+    for it in parse_pretend(out).items:
+        if it["cp"] == cp:
+            return it["kind"] == "ebuild"
+    return None
+
+
+def build_hint(cp):
+    t = build_time_hint([cp]).get(cp)
+    if t:
+        return T(f"раньше собирался {t}", f"took {t} last time")
+    if cp.split("/")[-1] in HEAVY:
+        return T("это может занять полчаса и больше", "this can take half an hour or more")
+    return ""
+
+
+def choose_bin_variant(cp, idx, a):
+    """Ask between CP and its prebuilt -bin variant; returns the chosen cp."""
+    alts = bin_variants(cp, idx)
+    if not alts:
+        return cp
+    alt = alts[0]
+    if alt in idx.installed or cp in idx.installed:
+        return alt if alt in idx.installed else cp
+    if a.bin:
+        return alt
+    if a.source:
+        return cp
+    ui.step(T(f"у {cp} есть готовая версия {ui.bold(alt)}, проверяю, соберётся ли обычная…",
+              f"{cp} has a prebuilt {ui.bold(alt)}; checking whether the regular one compiles…"))
+    comp = will_compile(cp)
+    bin_txt = T("готовый бинарник от разработчиков, без компиляции, ставится за пару минут",
+                "the upstream prebuilt binary: no compiling, installs in a couple of minutes")
+    if comp is False:
+        reg_txt = T("тоже готовый: скачается с бинхоста Gentoo, с твоими USE-флагами",
+                    "also prebuilt: downloads from the Gentoo binhost, with your USE flags")
+        first = cp
+    else:
+        hint = build_hint(cp)
+        reg_txt = (T("СОБИРАЕТСЯ ИЗ ИСХОДНИКОВ", "COMPILES FROM SOURCE") + (f" ({hint})" if hint else "")
+                   if comp else T("не удалось проверить, возможно соберётся из исходников",
+                                  "couldn't check; it may compile from source"))
+        first = alt
+    options = [(alt, bin_txt), (cp, reg_txt)]
+    if first == cp:
+        options.reverse()
+    if ui.yes:
+        choice = options[0][0]
+        ui.step(T(f"беру {choice}", f"taking {choice}"))
+        return choice
+    items = [f"{ui.bold(c)}  {ui.dim(t) if c == alt else (ui.yellow(t) if comp else ui.green(t))}" for c, t in options]
+    details = [idx.by_cp[c]["desc"] if c in idx.by_cp else "" for c, _ in options]
+    i = ui.pick(T("Какую версию поставить?", "Which version to install?"), items, details)
+    return None if i is None else options[i][0]
+
+
+def handle_ignored_bin(plan, a, tag):
+    ui.warn(T("бинарники есть, но с другими USE-флагами:", "binaries exist, but with different USE flags:"))
+    for cpv, fl in plan.ignored_bin:
+        ui.out(f"     {ui.bold(cpv_to_cp(cpv))}  {ui.dim(T('у бинарника:', 'binary has:'))} {ui.cyan(fl)}")
+    if ui.yes or a.dry_run or a.explain:
+        return []
+    i = ui.pick(T("Как быть?", "What to do?"), [T("собрать со своими USE (дольше)", "build with your USE (slower)"),
+                              T("взять бинарники и подстроить USE под них (быстро)", "use binaries and match USE to them (fast)")],
+                [T("оставляю твои флаги как есть", "your flags stay as they are"), T("toe запишет package.use под флаги бинхоста; откат — toe undo", "toe writes package.use matching the binhost; revert: toe undo")])
+    if i == 1:
+        lines = [f"{cpv_to_cp(cpv)} {fl}" for cpv, fl in plan.ignored_bin if fl]
+        r = write_portage_change("use", lines, "binuse-" + norm(tag)[:30])
+        ui.ok(T(f"записала USE под бинарники: {ui.dim(r['path'])}", f"wrote USE to match binaries: {ui.dim(r['path'])}"))
+        return [r]
+    return []
+
+
+def show_changes(need):
+    names = {"keyword": T("разрешить тестовую ветку (~amd64)", "accept testing branch (~amd64)"),
+             "use": T("изменить USE-флаги", "change USE flags"), "license": T("принять лицензии", "accept licenses")}
+    ui.head(T("Нужны изменения в /etc/portage", "Needs changes in /etc/portage"))
+    for kind, ls in need.items():
+        ui.out(f"{ui.star_y()} {names[kind]}")
+        for l in ls:
+            if not l.startswith("#"):
+                ui.out("    " + ui.cyan(l))
+
+
+def show_plan(plan, idx, picked=()):
+    rows = plan_rows(plan, idx)
+    if not rows:
+        return
+    nb = sum(1 for i in plan.items if prebuilt(i))
+    ns = sum(1 for i in plan.items if i["kind"] == "ebuild" and not prebuilt(i))
+    d = ui.dim(ui.sym["dot"])
+    head = T(f"{len(rows)} пак.", f"{len(rows)} packages")
+    head += f"  {d}  " + ui.green(T(f"{nb} бинарных", f"{nb} binary"))
+    if ns:
+        head += f"  {d}  " + ui.yellow(T(f"{ns} из исходников", f"{ns} from source"))
+    ui.head(head)
+    ui.table(rows, indent="  ")
+    for it in plan.items:
+        if it["kind"] == "ebuild" and it["cp"] in picked and not it["cp"].endswith("-bin"):
+            hint = build_hint(it["cp"])
+            ui.warn(T(f"{ui.bold(it['cp'])} будет собираться из исходников", f"{ui.bold(it['cp'])} will compile from source") +
+                    (ui.dim(f" ({hint})") if hint else ""))
+    if ns:
+        times = build_time_hint([i["cp"] for i in plan.items if i["kind"] == "ebuild" and not prebuilt(i)])
+        if times:
+            ui.out("  " + ui.dim(T("раньше собирались: ", "previous builds: ") +
+                                ", ".join(f"{k.split('/')[-1]} {v}" for k, v in list(times.items())[:3])))
+
+
+def flatpak_search(q):
+    if not shutil.which("flatpak"):
+        return []
+    rc, out = run(["flatpak", "search", "--columns=application,name", q], capture=True)
+    res = []
+    if rc == 0:
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and "." in parts[0]:
+                res.append((parts[0].strip(), parts[1].strip()))
+    return res
+
+
+def cmd_remove(a, argv):
+    ensure_root(argv)
+    banner("remove", " ".join(a.packages))
+    idx = load_index(show=False)
+    aliases = load_aliases()
+    ui.head(T("Ищу среди установленных", "Looking among installed packages"))
+    targets = []
+    for q in a.packages:
+        res = resolve(q, idx, aliases, only_installed=True)
+        if res.kind == "none" or not res.matches:
+            ui.out(T(f"   {ui.red(ui.sym['err'])} «{q}» не установлен", f"   {ui.red(ui.sym['err'])} «{q}» is not installed"))
+            continue
+        m = choose_match(res, idx)
+        if not m:
+            continue
+        if m.cp in CRITICAL and not a.force:
+            ui.err(T(f"{m.cp} — важная часть системы, не удаляю (если очень надо: --force)", f"{m.cp} is a core system package, not removing (if you really must: --force)"))
+            continue
+        targets.append(m.cp)
+        ui.ok(f"{ui.badge('del')}  {pkg_line(m.e, idx, False)}")
+    if not targets:
+        return 1
+
+    if a.force:
+        ui.warn(T("--force: удаляю напрямую (emerge --unmerge), без проверки зависимостей!", "--force: removing directly (emerge --unmerge), no dependency checks!"))
+        if not ui.ask(T("Точно?", "Are you sure?"), False):
+            return 1
+        take_snapshot("unmerge " + " ".join(targets))
+        return run(["emerge", "--unmerge"] + targets)[0]
+
+    rows = [[ui.badge("del"), ui.dim(t.split("/")[0] + "/") + ui.bold(t.split("/")[1])] for t in targets]
+    ui.head(T(f"Удалить ({len(targets)})", f"Remove ({len(targets)})"))
+    ui.table(rows)
+    ui.out()
+    if a.dry_run or a.explain:
+        ui.out(ui.dim(f"   $ emerge --deselect {' '.join(targets)}"))
+        ui.out(ui.dim(f"   $ emerge --depclean {' '.join(targets)}"))
+        return 0
+    if not ui.ask(T("Удалить?", "Remove?"), True):
+        return 1
+    take_snapshot("remove " + " ".join(targets))
+    was_world = [t for t in targets if t in idx.world]
+    if was_world:
+        run(["emerge", "--deselect"] + was_world, capture=True)
+
+    ui.head(T("Проверяю, что от них зависит", "Checking what depends on them"))
+    rc, out = run(["emerge", "--pretend", "--depclean", "--color=n"] + targets, capture=True)
+    removable, pulled = parse_depclean(out)
+    blocked = [t for t in targets if t not in removable]
+    for t in blocked:
+        who = pulled.get(t, [])
+        ui.warn(T(f"{ui.bold(t)} нужен другим пакетам", f"{ui.bold(t)} is needed by other packages") + (":" if who else ""))
+        for w in who[:5]:
+            ui.out("       " + ui.dim(w))
+        if t in was_world:
+            if ui.ask(T(f"Вернуть {t} в @world (как явно установленный)?", f"Put {t} back into @world (as explicitly installed)?"), True):
+                run(["emerge", "--noreplace", t], capture=True)
+            else:
+                ui.out(ui.dim(T("     ок, он удалится сам, когда станет никому не нужен", "     ok, it will go away once nothing needs it")))
+    go = [t for t in targets if t in removable]
+    if not go:
+        return 1
+    rc = emerge_live(["--depclean"] + go)
+    if rc == 0:
+        if a.purge:
+            purge_records(go)
+        ui.ok(ui.bold(T("удалено: ", "removed: ")) + ", ".join(go))
+        offer_orphans()
+        after_ops()
+    return rc
+
+
+def parse_depclean(out):
+    """-> (set of removable cps, {cp: [who pulls it in]})"""
+    removable, pulled, cur = set(), {}, None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("All selected packages:"):
+            for cpv in s.split(":", 1)[1].split():
+                removable.add(cpv_to_cp(cpv))
+            cur = None
+            continue
+        m = re.match(r"^(\S+/\S+) pulled in by:$", s)
+        if m:
+            cur = cpv_to_cp(m.group(1))
+            pulled[cur] = []
+            continue
+        if cur is not None:
+            if not s:
+                cur = None
+            else:
+                pulled[cur].append(s)
+    return removable, pulled
+
+
+def purge_records(cps):
+    j = read_json(JOURNAL, [])
+    keep = []
+    names = {c.split("/")[-1] for c in cps}
+    for entry in j:
+        if set(entry.get("packages", [])) and {p.split("/")[-1] for p in entry["packages"]} <= names:
+            for r in entry["records"]:
+                if revert_record(r):
+                    ui.ok(T(f"убрала правку toe: {ui.dim(r['path'])}", f"removed toe change: {ui.dim(r['path'])}"))
+        else:
+            keep.append(entry)
+    write_json(JOURNAL, keep)
+
+
+def offer_orphans():
+    rc, out = run(["emerge", "--pretend", "--depclean", "--color=n"], capture=True)
+    m = re.search(r"Number to remove:\s+(\d+)", out)
+    if m and int(m.group(1)) > 0:
+        n = int(m.group(1))
+        if ui.ask(T(f"Есть {n} ненужных пакетов-сирот. Убрать?", f"There are {n} orphaned packages. Remove them?"), False):
+            emerge_live(["--depclean"])
+
+
+def cmd_search(a, argv):
+    idx = load_index()
+    q = " ".join(a.query)
+    res = resolve(q, idx, load_aliases())
+    ms = res.matches[:]
+    if res.kind in ("exact",):
+        extra = fuzzy_candidates(norm(q), query_variants(q)[0], query_variants(q)[1], idx.entries, idx)
+        seen = {m.cp for m in ms}
+        ms += [m for m in extra if m.cp not in seen]
+    ms += [m for m in desc_search(q, idx.entries, idx, set()) if m.cp not in {x.cp for x in ms}]
+    ms = ms[:a.limit]
+    if not ms:
+        ui.out(T(f"{ui.red(ui.sym['err'])} ничего не нашла по «{q}»", f"{ui.red(ui.sym['err'])} nothing found for «{q}»"))
+        return 1
+    ui.head(f"«{q}» {ui.dim(ui.sym['dot'])} {len(ms)}")
+    for m in ms:
+        e = m.e
+        ui.out(f"   {pkg_badges(e, idx)}  {pkg_line(e, idx, False)}")
+        if e["desc"]:
+            ui.out("        " + ui.dim(truncate_visible(e["desc"], ui.width - 10)))
+    return 0
+
+
+def cmd_info(a, argv):
+    portage = _portage()
+    idx = load_index()
+    res = resolve(a.package, idx, load_aliases())
+    m = choose_match(res, idx)
+    if not m:
+        return 1
+    e = m.e
+    eroot = portage.settings["EROOT"]
+    portdb = portage.db[eroot]["porttree"].dbapi
+    vardb = portage.db[eroot]["vartree"].dbapi
+    arch = portage.settings.get("ARCH", "amd64")
+    vers = []
+    for cpv in portdb.cp_list(e["cp"]):
+        try:
+            kw, slot, lic, repo = portdb.aux_get(cpv, ["KEYWORDS", "SLOT", "LICENSE", "repository"])
+        except Exception:
+            continue
+        k = kw.split()
+        st = ui.green("stable") if arch in k else (ui.yellow("~" + arch) if "~" + arch in k else ui.red("masked"))
+        vers.append([ui.bold(cpv_version(cpv)), ui.dim(":" + slot.split("/")[0]), st, ui.magenta("::" + repo)])
+    inst = [cpv_version(c) for c in vardb.match(e["cp"])]
+    lines = [
+        f"{ui.dim(T('описание', 'about   '))}  {e['desc']}",
+        f"{ui.dim(T('сайт    ', 'homepage'))}  {e['homepage']}",
+        f"{ui.dim(T('статус  ', 'status  '))}  {pkg_badges(e, idx)}" + (f"  {ui.blue(', '.join(inst))}" if inst else ""),
+        f"{ui.dim(T('в world ', 'in world'))}  {T('да', 'yes') if e['cp'] in idx.world else T('нет', 'no')}",
+    ]
+    if vers:
+        try:
+            lic = portdb.aux_get(portdb.cp_list(e["cp"])[-1], ["LICENSE"])[0]
+            lines.append(f"{ui.dim(T('лицензия', 'license '))}  {lic}")
+        except Exception:
+            pass
+    ui.box(e["cp"], lines)
+    if vers:
+        ui.head(T("Версии", "Versions"))
+        ui.table(vers)
+    return 0
+
+
+def cmd_update(a, argv):
+    ensure_root(argv)
+    banner("update")
+    take_snapshot("update")
+    if not a.no_sync:
+        ui.head(T("Синхронизирую репозитории", "Syncing repositories"))
+        rc, out = run(["emaint", "sync", "-a"], capture=not ui.verbose)
+        if rc != 0:
+            ui.err(T("sync не удался", "sync failed"))
+            ui.out(ui.dim("\n".join(out.splitlines()[-15:])))
+            return rc
+        ui.ok(T("репозитории свежие", "repositories are fresh"))
+    idx = load_index()
+    flags = ["--verbose", "--update", "--deep", "--newuse", "--with-bdeps=y", "--getbinpkg"]
+    ui.head(T("Считаю обновления", "Calculating updates"))
+    for attempt in range(8):
+        rc, out = run(["emerge", "--pretend", "--color=n"] + flags +
+                      ["--autounmask=y", "--autounmask-write=n", "--autounmask-license=y", "@world"], capture=True)
+        plan = parse_pretend(out)
+        need = {k: v for k, v in plan.changes.items() if v and k in CHANGE_DIRS}
+        if not need or a.dry_run or a.explain:
+            break
+        show_changes(need)
+        if not ui.ask(T("Применить эти изменения в /etc/portage?", "Apply these changes to /etc/portage?"), True):
+            return 1
+        recs = [write_portage_change(kind, lines, "update") for kind, lines in need.items()]
+        for r in recs:
+            ui.ok(T("записала ", "wrote ") + ui.dim(r["path"]))
+        journal_add(" ".join(sys.argv), recs, [])
+    if not plan.items:
+        if rc != 0:
+            ui.err(T("emerge не смог посчитать обновления:", "emerge could not calculate updates:"))
+            show_emerge_error(out)
+            return rc
+        ui.final = ui.c("1;32", T("система актуальна", "system is up to date"))
+        after_ops()
+        return 0
+    show_plan(plan, idx)
+    if a.dry_run or a.explain:
+        return 0
+    if not ui.ask(T("Обновить?", "Update?"), True):
+        return 1
+    ui.head(T("Обновляю", "Updating"))
+    rc = emerge_live(flags + ["--quiet-build=y", "@world"])
+    if rc == 0:
+        fix_preserved()
+        kernel_hint()
+        ui.final = ui.c("1;32", T("система обновлена", "system updated"))
+        after_ops()
+    return rc
+
+
+def fix_preserved():
+    reg = "/var/lib/portage/preserved_libs_registry"
+    try:
+        with open(reg) as f:
+            if json.load(f):
+                ui.head(T("Пересобираю пакеты со старыми библиотеками", "Rebuilding packages using old libraries"))
+                emerge_live(["@preserved-rebuild"])
+    except (OSError, ValueError):
+        pass
+
+
+def vkey(v):
+    return [int(x) for x in re.findall(r"\d+", v)]
+
+
+def newer_kernels():
+    run_k = os.uname().release
+    mods = os.listdir("/lib/modules") if os.path.isdir("/lib/modules") else []
+    return sorted((m for m in mods if vkey(m) > vkey(run_k)), key=vkey)
+
+
+def kernel_hint():
+    newer = newer_kernels()
+    if newer:
+        ui.warn(T(f"установлено новое ядро ({newer[-1]}) — перезагрузись, чтобы на него перейти", f"new kernel installed ({newer[-1]}) — reboot to switch to it"))
+
+
+def cmd_clean(a, argv):
+    ensure_root(argv)
+    banner("clean")
+    if newer_kernels():
+        ui.warn(T("ты ещё не загрузился в новое ядро — старое depclean может удалить. "
+                "Сначала перезагрузись (и если что — rollback до чистки).", "you have not booted the new kernel yet — depclean may remove the old one. "
+                "Reboot first (and roll back before cleaning if needed)."))
+        if not ui.ask(T("Всё равно чистить?", "Clean anyway?"), False):
+            return 1
+    ui.head(T("Ненужные пакеты", "Unneeded packages"))
+    _rc, out = run(["emerge", "--pretend", "--depclean", "--color=n"], capture=True)
+    removable, _ = parse_depclean(out)
+    rc = 0
+    if removable:
+        ui.table([[ui.badge("del"), ui.dim(c.split("/")[0] + "/") + ui.bold(c.split("/")[-1])] for c in sorted(removable)])
+        ui.out()
+        if not (a.dry_run or a.explain) and ui.ask(T(f"Удалить {len(removable)} ненужных пакетов?", f"Remove {len(removable)} unneeded packages?"), True):
+            rc = emerge_live(["--depclean"])
+    else:
+        ui.ok(T("ненужных пакетов нет", "no unneeded packages"))
+    if a.dry_run or a.explain:
+        return 0
+    if shutil.which("eclean-dist"):
+        ui.head(T("Старые исходники (distfiles)", "Old sources (distfiles)"))
+        run(["eclean-dist", "--deep"])
+    if shutil.which("eclean-pkg"):
+        ui.head(T("Старые бинарные пакеты", "Old binary packages"))
+        run(["eclean-pkg", "--deep"])
+    after_ops()
+    return rc
+
+
+def cmd_list(a, argv):
+    idx = load_index(show=False)
+    cps = sorted(idx.installed if a.all else idx.world)
+    ui.head((T("Все установленные", "All installed") if a.all else T("Установлены тобой (@world)", "Installed by you (@world)")) + f" {ui.dim(ui.sym['dot'])} {len(cps)}")
+    for cp in cps:
+        e = idx.by_cp.get(cp)
+        if e:
+            ui.out(f"   {pkg_line(e, idx, False)}  {ui.dim(truncate_visible(e['desc'], 50))}")
+        else:
+            ui.out(f"   {cp}")
+    return 0
+
+
+def resolve_installed_cp(q):
+    idx = load_index(show=False)
+    res = resolve(q, idx, load_aliases(), only_installed=True)
+    m = choose_match(res, idx)
+    return m.cp if m else None
+
+
+def cmd_why(a, argv):
+    cp = resolve_installed_cp(a.package)
+    if not cp:
+        return 1
+    if shutil.which("equery"):
+        ui.head(T(f"Кому нужен {cp}", f"What needs {cp}"))
+        return run(["equery", "depends", cp])[0]
+    ui.err(T("нужен app-portage/gentoolkit (equery)", "app-portage/gentoolkit (equery) is required"))
+    return 1
+
+
+def cmd_files(a, argv):
+    cp = resolve_installed_cp(a.package)
+    if not cp:
+        return 1
+    if shutil.which("qlist"):
+        return run(["qlist", cp])[0]
+    return run(["equery", "files", cp])[0]
+
+
+def cmd_owns(a, argv):
+    path = a.path
+    if "/" not in path and shutil.which(path):
+        path = shutil.which(path)
+    if shutil.which("qfile"):
+        return run(["qfile", path])[0]
+    return run(["equery", "belongs", path])[0]
+
+
+def cmd_history(a, argv):
+    if not shutil.which("qlop"):
+        ui.err(T("нужен app-portage/portage-utils (qlop)", "app-portage/portage-utils (qlop) is required"))
+        return 1
+    return run(["qlop", "-mut"] + ([a.package] if a.package else []))[0]
+
+
+def cmd_fix(a, argv):
+    ensure_root(argv)
+    banner("fix")
+    fix_preserved()
+    ui.head(T("Проверяю базу Portage", "Checking the Portage database"))
+    run(["emaint", "--fix", "all"])
+    after_ops()
+    return 0
+
+
+def cmd_doctor(a, argv):
+    banner("doctor")
+    portage = _portage()
+    s = portage.settings
+    rows = []
+
+    def row(ok, what, detail=""):
+        rows.append([ui.green(ui.sym["ok"]) if ok is True else (ui.yellow(ui.sym["warn"]) if ok is None else ui.red(ui.sym["err"])),
+                     what, ui.dim(detail)])
+
+    age = sync_age_days()
+    row(age is not None and age <= CONF["sync_max_age_days"] if age is not None else None,
+        T("свежесть дерева", "tree freshness"), T(f"{age:.1f} дн.", f"{age:.1f} days") if age is not None else T("неизвестно", "unknown"))
+    feats = s.get("FEATURES", "").split()
+    row("getbinpkg" in feats, T("бинарники включены (FEATURES=getbinpkg)", "binaries enabled (FEATURES=getbinpkg)"))
+    br = glob.glob("/etc/portage/binrepos.conf/*") + (["/etc/portage/binrepos.conf"] if os.path.isfile("/etc/portage/binrepos.conf") else [])
+    row(bool(br), "binrepos.conf", ", ".join(os.path.basename(x) for x in br))
+    for tool, pkg in (("equery", "gentoolkit"), ("qlop", "portage-utils"), ("eselect", "eselect"),
+                      ("flatpak", T("flatpak (необязательно)", "flatpak (optional)"))):
+        row(True if shutil.which(tool) else None, f"{tool}", "" if shutil.which(tool) else T(f"нет — {pkg}", f"missing — {pkg}"))
+    row(True if os.access(SNAPSHOT_BIN, os.X_OK) else None, T("btrfs-снимки", "btrfs snapshots"), SNAPSHOT_BIN if os.access(SNAPSHOT_BIN, os.X_OK) else T("нет", "no"))
+    row(os.path.exists(POSTSYNC_HOOK) or None, T("хук обновления индекса toe", "toe index update hook"), "" if os.path.exists(POSTSYNC_HOOK) else "→ toe setup")
+    j = read_json(JOURNAL, [])
+    row(True, T("правок toe в /etc/portage", "toe changes in /etc/portage"), str(sum(len(x["records"]) for x in j)))
+    ui.head(T("Состояние системы", "System health"))
+    ui.table(rows)
+    ui.out()
+    after_ops()
+    return 0
+
+
+def cmd_undo(a, argv):
+    ensure_root(argv)
+    j = read_json(JOURNAL, [])
+    if not j:
+        ui.ok(T("toe ничего не менял в /etc/portage", "toe has not changed anything in /etc/portage"))
+        return 0
+    last = j[-1]
+    when = _dt.datetime.fromtimestamp(last["time"]).strftime("%d.%m %H:%M")
+    ui.head(T(f"Последняя правка: {when}", f"Last change: {when}"))
+    ui.out("   " + ui.dim(last["cmd"]))
+    for r in last["records"]:
+        ui.out("   " + ui.cyan(r["path"]))
+    if not ui.ask(T("Откатить?", "Revert?"), True):
+        return 1
+    for r in last["records"]:
+        if revert_record(r):
+            ui.ok(T(f"откатила {ui.dim(r['path'])}", f"reverted {ui.dim(r['path'])}"))
+    j.pop()
+    write_json(JOURNAL, j)
+    ui.out(ui.dim(T("   пакеты, уже собранные с этими правками, остаются; удалить: toe remove ...", "   packages already built with these changes stay; remove with: toe remove ...")))
+    return 0
+
+
+def cmd_alias(a, argv):
+    if a.action == "list":
+        al = load_aliases()
+        for k in sorted(al):
+            ui.out(f"   {ui.bold(k)} {ui.dim(ui.sym['arrow'])} {al[k]}")
+        return 0
+    ensure_root(argv)
+    os.makedirs(ALIAS_DIR, exist_ok=True)
+    fn = os.path.join(ALIAS_DIR, "user.conf")
+    with open(fn, "a") as f:
+        f.write(f"{a.name} = {a.atom}\n")
+    ui.ok(f"{a.name} {ui.sym['arrow']} {a.atom}")
+    return 0
+
+
+def cmd_reindex(a, argv):
+    idx = load_index(force=True, show=not a.quiet)
+    return 0 if idx.entries else 1
+
+
+def cmd_self_update(a, argv):
+    """Download the latest toe from its GitHub repo, check it, and replace this file."""
+    ensure_root(argv)
+    banner("self-update")
+    import urllib.request
+    me = os.path.realpath(sys.argv[0])
+    url = CONF["update_url"]
+    ui.head(T("Скачиваю свежий toe", "Downloading the latest toe"))
+    ui.step(ui.dim(url))
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            text = r.read().decode("utf-8")
+    except Exception as e:
+        ui.err(T(f"не получилось скачать: {e}", f"download failed: {e}"))
+        return 1
+    m = re.search(r'^VERSION = "([^"]+)"', text, re.M)
+    if not text.startswith("#!/usr/bin/env python3") or not m:
+        ui.err(T("скачалось что-то не то — это не toe", "that download isn't toe"))
+        return 1
+    try:
+        compile(text, "toe", "exec")
+    except SyntaxError as e:
+        ui.err(T(f"в скачанном файле ошибка, не ставлю: {e}", f"the download is broken, not installing it: {e}"))
+        return 1
+    try:
+        with open(me) as f:
+            same = f.read() == text
+    except OSError:
+        same = False
+    if same:
+        ui.final = ui.c("1;32", T(f"toe {VERSION} уже самый свежий", f"toe {VERSION} is already the latest"))
+        return 0
+    tmp = me + ".new"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, me)
+    log(f"self-update {VERSION} -> {m.group(1)}")
+    ui.final = ui.c("1;32", f"toe {VERSION} {ui.sym['arrow']} {m.group(1)}")
+    return 0
+
+
+def cmd_setup(a, argv):
+    ensure_root(argv)
+    banner("setup")
+    os.makedirs(os.path.dirname(POSTSYNC_HOOK), exist_ok=True)
+    me = os.path.abspath(sys.argv[0])
+    with open(POSTSYNC_HOOK, "w") as f:
+        f.write(f"#!/bin/sh\n# rebuild toe search index after every sync\n{sys.executable} {me} reindex --quiet >/dev/null 2>&1 &\n")
+    os.chmod(POSTSYNC_HOOK, 0o755)
+    ui.ok(T(f"хук после sync: {ui.dim(POSTSYNC_HOOK)}", f"post-sync hook: {ui.dim(POSTSYNC_HOOK)}"))
+    os.makedirs(ALIAS_DIR, exist_ok=True)
+    if not os.path.exists(CONF_FILE):
+        with open(CONF_FILE, "w") as f:
+            f.write("# toe config — all keys are optional\n")
+            for k, v in DEFAULT_CONF.items():
+                f.write(f"# {k} = {str(v).lower() if isinstance(v, bool) else v}\n")
+        ui.ok(T(f"конфиг: {ui.dim(CONF_FILE)}", f"config: {ui.dim(CONF_FILE)}"))
+    for d in (STATE_DIR, CACHE_DIR):
+        os.makedirs(d, exist_ok=True)
+    load_index(force=True)
+    write_completions(me)
+    ui.final = ui.c("1;32", T("toe готов", "toe is ready"))
+    return 0
+
+
+def write_completions(me):
+    bash = """# bash completion for toe
+_toe() {
+  local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[1]}
+  if [ $COMP_CWORD -eq 1 ]; then
+    COMPREPLY=($(compgen -W "install remove search info update clean list why files owns history fix doctor undo alias reindex setup self-update" -- "$cur")); return
+  fi
+  case $cmd in
+    install|search|info) COMPREPLY=($(compgen -W "$(toe _names 2>/dev/null)" -- "$cur")) ;;
+    remove|why|files) COMPREPLY=($(compgen -W "$(toe _names --installed 2>/dev/null)" -- "$cur")) ;;
+  esac
+}
+complete -F _toe toe
+"""
+    for d in ("/usr/share/bash-completion/completions",):
+        if os.path.isdir(d):
+            with open(os.path.join(d, "toe"), "w") as f:
+                f.write(bash)
+            ui.ok(T("автодополнение bash", "bash completion"))
+    fishd = "/usr/share/fish/vendor_completions.d"
+    if os.path.isdir(fishd):
+        with open(os.path.join(fishd, "toe.fish"), "w") as f:
+            f.write("complete -c toe -f -n '__fish_use_subcommand' -a 'install remove search info update clean list why files owns history fix doctor undo alias reindex setup self-update'\n"
+                    "complete -c toe -f -n '__fish_seen_subcommand_from install search info' -a '(toe _names)'\n"
+                    "complete -c toe -f -n '__fish_seen_subcommand_from remove why files' -a '(toe _names --installed)'\n")
+        ui.ok(T("автодополнение fish", "fish completion"))
+
+
+def cmd_names(a, argv):
+    ui.quiet = True
+    for p in (os.path.join(CACHE_DIR, "index.json"), os.path.join(USER_CACHE_DIR, "index.json")):
+        d = read_json(p, None)
+        if d:
+            break
+    else:
+        return 1
+    if a.installed:
+        try:
+            for cat in os.listdir("/var/db/pkg"):
+                for pv in os.listdir(os.path.join("/var/db/pkg", cat)):
+                    print(cpv_to_cp(f"{cat}/{pv}").split("/")[1])
+        except OSError:
+            pass
+        return 0
+    for e in d["entries"]:
+        print(e["pn"])
+    return 0
+
+
+# ─────────────────────────────── main ──────────────────────────────────────
+
+def _common(parser, suppress):
+    d = {"default": argparse.SUPPRESS} if suppress else {}
+    parser.add_argument("-y", "--yes", action="store_true", help=T("не задавать вопросов", "assume yes, no questions"), **d)
+    parser.add_argument("-n", "--dry-run", action="store_true", help=T("только показать, что будет", "only show what would happen"), **d)
+    parser.add_argument("--explain", action="store_true", help=T("показать команды emerge, ничего не делать", "print emerge commands, do nothing"), **d)
+    parser.add_argument("-v", "--verbose", action="store_true", help=T("сырой вывод emerge", "raw emerge output"), **d)
+    parser.add_argument("-q", "--quiet", action="store_true", help=T("поменьше текста", "less output"), **d)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="toe", description=T("дружелюбный пакетник для Gentoo (обёртка над emerge)", "friendly package manager for Gentoo (emerge wrapper)"))
+    _common(p, False)
+    p.add_argument("--version", action="version", version=f"toe {VERSION}")
+    sp = p.add_subparsers(dest="cmd", metavar="command")
+    common = argparse.ArgumentParser(add_help=False)
+    _common(common, True)
+    _add = sp.add_parser
+    sp.add_parser = lambda *x, **k: _add(*x, parents=[common], **k)
+
+    i = sp.add_parser("install", aliases=["i", "add"], help=T("установить пакеты", "install packages"))
+    i.add_argument("packages", nargs="+")
+    i.add_argument("--bin", action="store_true", help=T("только бинарники", "binary packages only"))
+    i.add_argument("--source", action="store_true", help=T("собрать из исходников", "build from source"))
+    i.add_argument("--reinstall", action="store_true")
+    i.add_argument("--oneshot", action="store_true", help=T("не добавлять в @world", "do not add to @world"))
+    i.add_argument("--no-sync-check", action="store_true")
+    i.set_defaults(fn=cmd_install)
+
+    r = sp.add_parser("remove", aliases=["rm", "uninstall"], help=T("удалить пакеты", "remove packages"))
+    r.add_argument("packages", nargs="+")
+    r.add_argument("--purge", action="store_true", help=T("убрать и правки toe в /etc/portage", "also drop toe changes in /etc/portage"))
+    r.add_argument("--force", action="store_true", help=T("emerge --unmerge без проверок (опасно)", "emerge --unmerge without checks (dangerous)"))
+    r.set_defaults(fn=cmd_remove)
+
+    s = sp.add_parser("search", aliases=["s", "find"], help=T("поиск пакетов", "search packages"))
+    s.add_argument("query", nargs="+")
+    s.add_argument("-l", "--limit", type=int, default=15)
+    s.set_defaults(fn=cmd_search)
+
+    x = sp.add_parser("info", help=T("подробно о пакете", "package details"))
+    x.add_argument("package")
+    x.set_defaults(fn=cmd_info)
+
+    u = sp.add_parser("update", aliases=["up", "upgrade"], help=T("sync + обновить систему", "sync + update the system"))
+    u.add_argument("--no-sync", action="store_true")
+    u.set_defaults(fn=cmd_update)
+
+    sp.add_parser("clean", help=T("убрать ненужное", "remove what is not needed")).set_defaults(fn=cmd_clean)
+    lst = sp.add_parser("list", aliases=["ls"], help=T("установленные пакеты", "installed packages"))
+    lst.add_argument("-a", "--all", action="store_true")
+    lst.set_defaults(fn=cmd_list)
+    w = sp.add_parser("why", help=T("кому нужен пакет", "what needs a package"))
+    w.add_argument("package")
+    w.set_defaults(fn=cmd_why)
+    f = sp.add_parser("files", help=T("файлы пакета", "package files"))
+    f.add_argument("package")
+    f.set_defaults(fn=cmd_files)
+    o = sp.add_parser("owns", help=T("чей это файл/команда", "which package owns a file/command"))
+    o.add_argument("path")
+    o.set_defaults(fn=cmd_owns)
+    h = sp.add_parser("history", help=T("история установок", "install history"))
+    h.add_argument("package", nargs="?")
+    h.set_defaults(fn=cmd_history)
+    sp.add_parser("fix", help="preserved-rebuild + emaint --fix").set_defaults(fn=cmd_fix)
+    sp.add_parser("doctor", help=T("проверить систему", "check the system")).set_defaults(fn=cmd_doctor)
+    sp.add_parser("undo", help=T("откатить последние правки toe в /etc/portage", "revert the last toe changes in /etc/portage")).set_defaults(fn=cmd_undo)
+    al = sp.add_parser("alias", help=T("свои псевдонимы", "your own aliases"))
+    al.add_argument("action", choices=["add", "list"])
+    al.add_argument("name", nargs="?")
+    al.add_argument("atom", nargs="?")
+    al.set_defaults(fn=cmd_alias)
+    ri = sp.add_parser("reindex", help=T("пересобрать индекс поиска", "rebuild search index"))
+    ri.set_defaults(fn=cmd_reindex)
+    sp.add_parser("setup", help=T("поставить хук, конфиг, автодополнение", "install hook, config, completions")).set_defaults(fn=cmd_setup)
+    sp.add_parser("self-update", aliases=["selfupdate"], help=T("обновить сам toe с GitHub", "update toe itself from GitHub")).set_defaults(fn=cmd_self_update)
+    nm = sp.add_parser("_names")
+    nm.add_argument("--installed", action="store_true")
+    nm.set_defaults(fn=cmd_names)
+    return p
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    p = build_parser()
+    a = p.parse_args(argv)
+    ui.yes, ui.verbose, ui.quiet = a.yes, a.verbose, a.quiet
+    if not getattr(a, "fn", None):
+        p.print_help()
+        return 0
+    if a.cmd == "alias" and a.action == "add" and not (a.name and a.atom):
+        ui.err(T("использование: toe alias add <имя> <категория/пакет>", "usage: toe alias add <name> <category/package>"))
+        return 2
+    try:
+        rc = a.fn(a, argv) or 0
+    except KeyboardInterrupt:
+        ui.progress_end()
+        rc = 130
+    ui.close(rc)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
