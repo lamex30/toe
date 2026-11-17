@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # ───────────────────────────── paths & config ──────────────────────────────
 
@@ -2320,9 +2320,26 @@ def cmd_update(a, argv):
     if not a.no_sync:
         ui.head(T("Синхронизирую репозитории", "Syncing repositories"))
         rc, out = run(["emaint", "sync", "-a"], capture=not ui.verbose)
+        # rsync.gentoo.org rotates mirrors; a broken one fails Manifest
+        # verification, and the next attempt usually lands on a good one.
+        for _ in range(2):
+            if rc == 0:
+                break
+            bad = re.findall(r"sync for repo: (\S+), returned code = [1-9]", out)
+            if not bad:
+                break
+            ui.warn(T("не синхронизировалось: ", "sync failed for: ") + ", ".join(bad) +
+                    T(" — пробую ещё раз (другое зеркало)", " — retrying (another mirror)"))
+            rc, out = 0, ""
+            for r in bad:
+                r_rc, r_out = run(["emaint", "sync", "-r", r], capture=not ui.verbose)
+                rc, out = rc or r_rc, out + r_out
         if rc != 0:
             ui.err(T("sync не удался", "sync failed"))
-            ui.out(ui.dim("\n".join(out.splitlines()[-15:])))
+            lines = out.splitlines()
+            log("sync output:\n" + out)
+            errs = [l for l in lines if re.search(r"!!!|ERROR|[Ee]rror|mismatch|failed", l)]
+            ui.out(ui.dim("\n".join((errs[-15:] + ["..."] if errs else []) + lines[-8:])))
             return rc
         ui.ok(T("репозитории свежие", "repositories are fresh"))
     idx = load_index()
