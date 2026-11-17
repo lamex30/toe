@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 # ───────────────────────────── paths & config ──────────────────────────────
 
@@ -337,6 +337,8 @@ class UI:
         try:
             ans = input(self.fix(prompt)).strip().lower()
         except EOFError:
+            # no input (stdin closed): take the default, and end the prompt line
+            print(T("да", "yes") if default else T("нет", "no"))
             return default
         if not ans:
             return default
@@ -964,7 +966,15 @@ def resolve(query, idx, aliases=None, only_installed=False):
     qn = norm(name)
     variants, hints = query_variants(name)
 
-    # 2. exact package name
+    # 2. aliases (curated, user, learned) incl. command names. They go before exact
+    # package names: "steam" must mean games-util/steam-launcher, not the dev-python/steam library.
+    if qn in aliases:
+        target = aliases[qn]
+        e = idx.by_cp.get(target)
+        if e and ok(e):
+            return Resolution("exact", [Match(e, 1.0, 3, T(f"псевдоним «{name}»", f"alias «{name}»"))], query, suffix)
+
+    # 3. exact package name
     hits = [e for e in idx.by_pn.get(ql, []) if ok(e)]
     if hits:
         good = [e for e in hits if not junk(e, qn)]
@@ -974,13 +984,6 @@ def resolve(query, idx, aliases=None, only_installed=False):
         ms = sorted((Match(e, 0.99 + bonus(e, idx, hints) - (0.2 if junk(e, qn) else 0), 2) for e in hits),
                     key=lambda m: -m.score)
         return Resolution("choose", ms, query, suffix)
-
-    # 3/4. aliases (curated, user, learned) incl. command names
-    if qn in aliases:
-        target = aliases[qn]
-        e = idx.by_cp.get(target)
-        if e and ok(e):
-            return Resolution("exact", [Match(e, 1.0, 3, T(f"псевдоним «{name}»", f"alias «{name}»"))], query, suffix)
 
     # 5. normalized forms (separators, synonyms)
     nh = []
@@ -1363,6 +1366,97 @@ def use_hints(out):
     return list(dict.fromkeys(hints))
 
 
+ML_FLAG = "abi_x86_32"
+
+
+def multilib_needs(atoms):
+    """Packages that must get USE=abi_x86_32 so ATOMS can be installed (steam, wine, ...).
+
+    emerge names them one per run, and to get out of a dead end it even suggests turning
+    the flag back off ('>=media-libs/mesa-26 -abi_x86_32'), so toe looped forever.
+    This walks the dependency tree once and returns the whole list."""
+    portage = _portage()
+    from portage.dep import Atom, use_reduce
+    try:
+        trees = portage.create_trees(config_root=os.environ.get("PORTAGE_CONFIGROOT", "/"), target_root="/")
+        t = trees[next(iter(trees))]
+        portdb, vardb = t["porttree"].dbapi, t["vartree"].dbapi
+        settings = portage.config(clone=portdb.settings)
+    except Exception as e:
+        log(f"multilib_needs: {e}")
+        return []
+
+    def best(atom):
+        return portdb.xmatch("bestmatch-visible", atom) or (portdb.xmatch("match-all", atom) or [""])[-1]
+
+    def walk(node, use, out):
+        i = 0
+        while i < len(node):
+            x = node[i]
+            if x == "||" and i + 1 < len(node):
+                alts = node[i + 1]
+                pick = next((a for a in alts if isinstance(a, Atom) and vardb.match(a)), alts[0] if alts else [])
+                walk(pick if isinstance(pick, list) else [pick], use, out)
+                i += 2
+                continue
+            if isinstance(x, list):
+                walk(x, use, out)
+            elif isinstance(x, Atom) and not x.blocker:
+                out.append(x.evaluate_conditionals(use))
+            i += 1
+
+    need, seen = [], set()
+    queue = [(Atom(a), True) for a in atoms if not a.startswith("@")]
+    while queue:
+        atom, top = queue.pop()
+        cpv = best(atom)
+        if not cpv or cpv in seen:
+            continue
+        seen.add(cpv)
+        try:
+            iuse, eapi, *deps = portdb.aux_get(cpv, ["IUSE", "EAPI", "DEPEND", "RDEPEND", "PDEPEND"])
+            settings.setcpv(cpv, mydb=portdb)
+        except Exception:
+            continue
+        use = set(settings["PORTAGE_USE"].split())
+        if not top:
+            if ML_FLAG not in [f.lstrip("+-") for f in iuse.split()]:
+                continue
+            if ML_FLAG not in use:
+                need.append(portage.cpv_getkey(cpv))
+            use.add(ML_FLAG)
+        for d in deps:
+            try:
+                tree = use_reduce(d, uselist=use, eapi=eapi, token_class=Atom)
+            except Exception:
+                continue
+            found = []
+            walk(tree, use, found)
+            for a in found:
+                if a.use and ML_FLAG in a.use.enabled:
+                    queue.append((Atom(a.cp), False))
+    return sorted(set(need))
+
+
+def drop_multilib_lines(lines):
+    """Remove emerge's own abi_x86_32 suggestions (toe supplies the complete list instead),
+    together with the '# required by' comments that belonged to them."""
+    out, pending = [], []
+    for l in lines:
+        if l.startswith("#"):
+            pending.append(l)
+            continue
+        if re.search(r"(^|\s)[-+]?" + ML_FLAG + r"(\s|$)", l):
+            rest = re.sub(r"(^|\s)[-+]?" + ML_FLAG + r"(?=\s|$)", "", l.split(None, 1)[1] if " " in l else "").strip()
+            if rest:
+                out += pending + [l.split(None, 1)[0] + " " + rest]
+            pending = []
+            continue
+        out += pending + [l]
+        pending = []
+    return out if any(not l.startswith("#") for l in out) else []
+
+
 def show_emerge_error(out, limit=25):
     lines = [l for l in out.splitlines() if not NOISE_RE.search(l.strip())]
     for ln in lines[-limit:]:
@@ -1383,9 +1477,15 @@ def parse_pretend(out):
             kind = m.group("kind")
             cpv = m.group("cpv")
             old = re.search(r"\[([^\]]+)\]", m.group("rest"))
-            item = {"kind": kind, "flags": m.group("flags"), "cpv": cpv.split("::")[0],
+            # emerge prints 'cat/pkg-1.0-r1:0/1::repo' (slot) and, for binpkgs, 'cat/pkg-1.0-r1-7' (build id)
+            base = cpv.split("::")[0].split(":")[0]
+            bid = re.match(r"^(.+)-\d+$", base)
+            if kind == "binary" and bid and CPV_RE.match(bid.group(1)):
+                base = bid.group(1)
+            cpv = base + ("::" + cpv.split("::")[1] if "::" in cpv else "")
+            item = {"kind": kind, "flags": m.group("flags"), "cpv": base,
                     "cp": cpv_to_cp(cpv), "repo": cpv.split("::")[1] if "::" in cpv else "",
-                    "old": old.group(1).split("::")[0] if old else ""}
+                    "old": old.group(1).split("::")[0].split(":")[0] if old else ""}
             if kind == "blocks":
                 plan.blockers.append(s)
             else:
@@ -1473,8 +1573,41 @@ def build_time_hint(cps):
 CHANGE_DIRS = {"keyword": "package.accept_keywords", "use": "package.use", "license": "package.license"}
 
 
+def supersede_use(lines):
+    """Comment out USE lines in toe's own zz-toe-* files that turn off a flag the new LINES turn on.
+    A versioned line ('>=media-libs/mesa-26 -abi_x86_32') beats an unversioned one in Portage,
+    so appending 'media-libs/mesa abi_x86_32' after it changes nothing."""
+    on = {}
+    for l in lines:
+        if l.startswith("#") or len(l.split()) < 2:
+            continue
+        atom, *flags = l.split()
+        on.setdefault(cpv_to_cp(atom.lstrip("=<>~")), set()).update(f.lstrip("+") for f in flags if not f.startswith("-"))
+    base = os.path.join(PORTAGE_ETC, CHANGE_DIRS["use"])
+    for fn in sorted(glob.glob(os.path.join(base, "zz-toe-*"))):
+        try:
+            with open(fn) as f:
+                old = f.read().splitlines(True)
+        except OSError:
+            continue
+        new = []
+        for l in old:
+            p = l.split()
+            if p and not p[0].startswith("#") and len(p) > 1:
+                cp = cpv_to_cp(p[0].lstrip("=<>~"))
+                if any(f.startswith("-") and f[1:] in on.get(cp, ()) for f in p[1:]):
+                    l = "# superseded by toe: " + l
+            new.append(l)
+        if new != old:
+            with open(fn, "w") as f:
+                f.writelines(new)
+            log(f"superseded USE lines in {fn}")
+
+
 def write_portage_change(kind, lines, tag):
     """Write lines into /etc/portage/package.*; returns journal record."""
+    if kind == "use":
+        supersede_use(lines)
     base = os.path.join(PORTAGE_ETC, CHANGE_DIRS[kind])
     stamp = _dt.datetime.now().isoformat(timespec="seconds")
     header = f"# added by toe {stamp}: {tag}\n"
@@ -1912,7 +2045,8 @@ def cmd_install(a, argv):
 
     records = []
     asked_bin = False
-    for attempt in range(8):
+    written = set()
+    for attempt in range(12):
         if attempt == 0:
             ui.head(T("Считаю зависимости", "Resolving dependencies"))
         rc, out = run(["emerge", "--pretend", "--color=n"] + flags +
@@ -1926,6 +2060,30 @@ def cmd_install(a, argv):
             ui.out(ui.dim(T("   причину смотри в package.mask профиля/репозитория; снять можно через /etc/portage/package.unmask", "   see the reason in the profile/repo package.mask; unmask via /etc/portage/package.unmask")))
             return 1
         need = {k: v for k, v in plan.changes.items() if v and k in CHANGE_DIRS}
+        if any(ML_FLAG in l for l in need.get("use", []) if not l.startswith("#")):
+            want = {cpv_to_cp(l.split()[0].lstrip("=<>~")) for l in need["use"]
+                    if not l.startswith("#") and re.search(r"(^|\s)\+?" + ML_FLAG + r"(\s|$)", l)}
+            want |= set(multilib_needs(atoms))
+            rest = drop_multilib_lines(need["use"])
+            if want:
+                rest += [T("# 32-битные библиотеки (toe собрала весь список сразу)",
+                           "# 32-bit libraries (toe collected the whole list at once)")]
+                rest += [f"{cp} {ML_FLAG}" for cp in sorted(want)]
+            if rest:
+                need["use"] = rest
+            else:
+                need.pop("use")
+        fresh = {k: [l for l in v if l.startswith("#") or l not in written] for k, v in need.items()}
+        if need and not any(not l.startswith("#") for v in fresh.values() for l in v):
+            # the same change again: it was written and did not help, writing it once more loops forever
+            ui.err(T("emerge снова просит те же изменения, которые toe уже записала, — дальше не продвинуться:",
+                     "emerge asks again for changes toe has already written; no way forward:"))
+            show_emerge_error(out, 30)
+            if records:
+                journal_add(" ".join(sys.argv), records, picked)
+                ui.out(ui.dim(T("   правки /etc/portage сохранены; откатить: toe undo", "   /etc/portage changes kept; revert with: toe undo")))
+            return 1
+        need = {k: v for k, v in fresh.items() if any(not l.startswith("#") for l in v)}
         if plan.ignored_bin and not a.source and not asked_bin:
             asked_bin = True
             got = handle_ignored_bin(plan, a, " ".join(a.packages))
@@ -1941,6 +2099,7 @@ def cmd_install(a, argv):
                 break
             tag = "-".join(sorted({cpv_to_cp(x).split("/")[-1] for x in picked})) or "deps"
             for kind, lines in need.items():
+                written.update(l for l in lines if not l.startswith("#"))
                 records.append(write_portage_change(kind, lines, tag))
                 ui.ok(T(f"записала {kind}: {ui.dim(records[-1]['path'])}", f"wrote {kind}: {ui.dim(records[-1]['path'])}"))
             continue
