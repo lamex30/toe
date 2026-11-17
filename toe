@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 # ───────────────────────────── paths & config ──────────────────────────────
 
@@ -558,13 +558,13 @@ CPV_RE = re.compile(r"^(?P<cp>[\w+][\w+.-]*/[\w+][\w+-]*?)-(?P<ver>\d[\w.]*(?:_(
 
 
 def cpv_to_cp(cpv):
-    cpv = cpv.split("::", 1)[0].lstrip("=<>~")
+    cpv = cpv.split(":", 1)[0].lstrip("=<>~")
     m = CPV_RE.match(cpv)
     return m.group("cp") if m else cpv
 
 
 def cpv_version(cpv):
-    m = CPV_RE.match(cpv.split("::", 1)[0].lstrip("=<>~"))
+    m = CPV_RE.match(cpv.split(":", 1)[0].lstrip("=<>~"))
     return m.group("ver") if m else ""
 
 
@@ -936,8 +936,15 @@ class Resolution:
         self.suffix = atom_suffix
 
 
+SLOT_Q_RE = re.compile(r"^([^:=<>~@\s]+?):([\w+][\w+.-]*(?:/[\w+.-]+)?)$")
+
+
 def split_version(q):
-    """'python@3.13' -> ('python', ':3.13'), 'firefox=128' -> ('firefox', '=128')"""
+    """'sys-fs/fuse:0' -> ('sys-fs/fuse', ':0'), 'python@3.13' -> ('python', ':3.13'),
+    'firefox=128' -> ('firefox', '=128')"""
+    m = SLOT_Q_RE.match(q)
+    if m:
+        return m.group(1), ":" + m.group(2)
     if "@" in q and not q.startswith("@"):
         name, slot = q.rsplit("@", 1)
         return name, ":" + slot
@@ -948,6 +955,114 @@ def split_version(q):
 
 
 def resolve(query, idx, aliases=None, only_installed=False):
+    res = _resolve(query, idx, aliases, only_installed)
+    if not res.suffix.startswith(":") or res.kind not in ("choose", "confirm") or len(res.matches) < 2:
+        return res
+    # 'fuse:3': of several packages with that name, keep the ones that have slot 3
+    slot = res.suffix[1:]
+    have = [m for m in res.matches if slot_cpvs(m.cp, slot, installed=only_installed)]
+    if not have:
+        return res
+    if len(have) == 1 and have[0].stage <= 5:
+        return Resolution("exact", have, query, res.suffix)
+    return Resolution(res.kind, have, query, res.suffix)
+
+
+def slot_atom(cp, slot):
+    """'cp:slot' as a portage Atom, or None when the slot is not a valid slot name."""
+    portage = _portage()
+    try:
+        return portage.dep.Atom(f"{cp}:{slot}")
+    except Exception:
+        return None
+
+
+def slot_cpvs(cp, slot, installed=False):
+    """Versions of CP in SLOT (subslot 'S/SUB' allowed): installed ones, or all in the tree."""
+    portage = _portage()
+    atom = slot_atom(cp, slot)
+    if atom is None:
+        return []
+    t = portage.db[portage.settings["EROOT"]]
+    try:
+        if installed:
+            return t["vartree"].dbapi.match(atom)
+        return t["porttree"].dbapi.xmatch("match-all", atom)
+    except Exception:
+        return []
+
+
+def pkg_slots(cp, installed=False):
+    """[(slot, best cpv)] of CP, newest first. From the tree: visible versions if there are
+    any, else all (keyworded ones are fine, toe unmasks them). installed=True: what is installed."""
+    portage = _portage()
+    t = portage.db[portage.settings["EROOT"]]
+    db = t["vartree" if installed else "porttree"].dbapi
+    try:
+        cpvs = db.match(cp) or ([] if installed else db.cp_list(cp))
+    except Exception:
+        return []
+    best = {}
+    for cpv in cpvs:
+        try:
+            s = db.aux_get(cpv, ["SLOT"])[0].split("/")[0]
+        except Exception:
+            continue
+        if s not in best or portage.vercmp(cpv_version(cpv), cpv_version(best[s])) > 0:
+            best[s] = cpv
+    import functools
+    order = sorted(best, key=functools.cmp_to_key(
+        lambda x, y: portage.vercmp(cpv_version(best[x]), cpv_version(best[y]))), reverse=True)
+    return [(s, best[s]) for s in order]
+
+
+def slot_items(cp, slots, inst):
+    """Picker lines for SLOTS of CP; INST = {slot: installed cpv}."""
+    items = []
+    for s, cpv in slots:
+        line = f"{ui.dim(cp.split('/')[0] + '/')}{ui.bold(cp.split('/')[1])}{ui.cyan(':' + s)}  {cpv_version(cpv)}"
+        if s in inst:
+            line += "  " + ui.blue(T(f"установлен {cpv_version(inst[s])}", f"installed {cpv_version(inst[s])}"))
+        items.append(line)
+    return items
+
+
+def choose_slot(cp, slot=""):
+    """Slot to install for CP. SLOT given: checked to exist, else offered from the real ones.
+    No SLOT and several slots: the user picks (newest first). Returns '' for 'just cp'
+    (one slot, or -y), the slot, or None to skip."""
+    slots = pkg_slots(cp)
+    inst = dict(pkg_slots(cp, installed=True))
+    if slot:
+        if slot_cpvs(cp, slot):
+            return slot
+        have = ", ".join(f":{s}" for s, _ in slots) or "—"
+        ui.out(T(f"   {ui.red(ui.sym['err'])} у {cp} нет слота :{slot}; есть: {have}",
+                 f"   {ui.red(ui.sym['err'])} {cp} has no slot :{slot}; there are: {have}"))
+        if not slots or ui.yes:
+            return None
+    elif len(slots) < 2:
+        return ""
+    elif ui.yes:
+        ui.step(T(f"у {cp} несколько слотов, беру тот, что выберет emerge (обычно новейший)",
+                  f"{cp} has several slots; taking the one emerge picks (usually the newest)"))
+        return ""
+    i = ui.pick(T(f"У {cp} несколько слотов (версий, которые ставятся рядом). Какой?",
+                  f"{cp} has several slots (versions installed side by side). Which one?"),
+                slot_items(cp, slots, inst), [T("ставится рядом с другими слотами", "installs next to the other slots")] * len(slots))
+    return None if i is None else slots[i][0]
+
+
+def world_atoms():
+    """Exact lines of @world (with their :slot)."""
+    try:
+        with open(WORLD_FILE) as f:
+            return {l.strip() for l in f if l.strip() and not l.startswith("#")}
+    except OSError:
+        return set()
+
+
+def _resolve(query, idx, aliases=None, only_installed=False):
     aliases = aliases or {}
     name, suffix = split_version(query.strip())
     pool = [e for e in idx.entries if e["cp"] in idx.installed] if only_installed else idx.entries
@@ -1982,7 +2097,7 @@ def cmd_install(a, argv):
             continue
         res = resolve(q, idx, aliases)
         if res.kind != "exact" and not q.startswith(("@", "=", "<", ">", "~")):
-            got = try_overlays(q, idx, res)
+            got = try_overlays(split_version(q)[0], idx, res)
             if got:
                 cp_new, rec = got
                 # journaled right away, so toe undo disables the overlay even if this run stops here
@@ -1994,10 +2109,10 @@ def cmd_install(a, argv):
                     ui.step(T("перезапускаю toe, чтобы Portage увидел новый оверлей", "restarting toe so Portage sees the new overlay"))
                     sys.stdout.flush()
                     os.execv(sys.executable, [sys.executable, os.path.realpath(sys.argv[0])] + argv)
-                res = Resolution("exact", [Match(idx.by_cp[cp_new], 1.0, 1)], q, "")
+                res = Resolution("exact", [Match(idx.by_cp[cp_new], 1.0, 1)], q, res.suffix)
         if res.kind == "none" or not res.matches:
             ui.out(T(f"   {ui.red(ui.sym['err'])} «{q}» не нашла в подключённых репозиториях", f"   {ui.red(ui.sym['err'])} «{q}» not found in enabled repositories"))
-            fp = flatpak_search(q) if CONF["flatpak_fallback"] != "never" else []
+            fp = flatpak_search(split_version(q)[0]) if CONF["flatpak_fallback"] != "never" else []
             if fp:
                 ui.out(T(f"     {ui.badge('flat')} есть на Flathub: {ui.bold(fp[0][1])} {ui.dim(fp[0][0])}", f"     {ui.badge('flat')} available on Flathub: {ui.bold(fp[0][1])} {ui.dim(fp[0][0])}"))
                 if ui.ask(T("Поставить через Flatpak?", "Install via Flatpak?"), False):
@@ -2017,16 +2132,32 @@ def cmd_install(a, argv):
             if cp is None:
                 ui.step(T("пропускаю", "skipping"))
                 continue
-        if cp in idx.installed and not a.reinstall and not res.suffix:
+        # slots: 'fuse:0' is checked to exist; plain 'fuse' with several slots asks which one
+        slot = ""
+        if res.suffix.startswith(":") or not res.suffix:
+            slot = choose_slot(cp, res.suffix[1:])
+            if slot is None:
+                ui.step(T("пропускаю", "skipping"))
+                continue
+        slot_txt = ui.cyan(":" + slot) if slot else ""
+        if slot:
+            have = slot_cpvs(cp, slot, installed=True)
+            if have and not a.reinstall:
+                ui.ok(T(f"{pkg_line(idx.by_cp[cp], idx, False)}{slot_txt} уже установлен ({', '.join(cpv_version(c) for c in have)})",
+                        f"{pkg_line(idx.by_cp[cp], idx, False)}{slot_txt} is already installed ({', '.join(cpv_version(c) for c in have)})"))
+                if f"{cp}:{slot}" not in world_atoms() and cp not in idx.world:
+                    atoms.append(f"{cp}:{slot}")   # adds to @world without rebuild thanks to --noreplace
+                continue
+        elif cp in idx.installed and not a.reinstall and not res.suffix:
             ui.ok(T(f"{pkg_line(idx.by_cp[cp], idx, False)} уже установлен", f"{pkg_line(idx.by_cp[cp], idx, False)} is already installed"))
             if cp not in idx.world:
                 atoms.append(cp)   # adds to @world without rebuild thanks to --noreplace
             continue
-        atom = cp + res.suffix if res.suffix.startswith(":") else (f"={cp}-{res.suffix[1:]}*" if res.suffix else cp)
+        atom = f"{cp}:{slot}" if slot else (f"={cp}-{res.suffix[1:]}*" if res.suffix.startswith("=") else cp)
         atoms.append(atom)
         picked.append(cp)
         note = f"{ui.dim(m.note)} {ui.dim(ui.sym['arrow'])} " if m.note else ""
-        ui.ok(f"{note}{pkg_line(idx.by_cp[cp], idx, False)}  {pkg_badges(idx.by_cp[cp], idx)}")
+        ui.ok(f"{note}{pkg_line(idx.by_cp[cp], idx, False)}{slot_txt}  {pkg_badges(idx.by_cp[cp], idx)}")
 
     for app in flatpak_wanted:
         run(["flatpak", "install", "-y" if ui.yes else "--noninteractive", "flathub", app])
@@ -2300,8 +2431,23 @@ def cmd_remove(a, argv):
         if m.cp in CRITICAL and not a.force:
             ui.err(T(f"{m.cp} — важная часть системы, не удаляю (если очень надо: --force)", f"{m.cp} is a core system package, not removing (if you really must: --force)"))
             continue
-        targets.append(m.cp)
-        ui.ok(f"{ui.badge('del')}  {pkg_line(m.e, idx, False)}")
+        inst = pkg_slots(m.cp, installed=True)
+        slot = res.suffix[1:] if res.suffix.startswith(":") else ""
+        if slot and not slot_cpvs(m.cp, slot, installed=True):
+            have = ", ".join(f":{s}" for s, _ in inst) or "—"
+            ui.out(T(f"   {ui.red(ui.sym['err'])} {m.cp}:{slot} не установлен; установлены: {have}",
+                     f"   {ui.red(ui.sym['err'])} {m.cp}:{slot} is not installed; installed: {have}"))
+            continue
+        if not slot and len(inst) > 1 and not ui.yes:
+            items = slot_items(m.cp, inst, {}) + [T(f"все слоты ({len(inst)})", f"all slots ({len(inst)})")]
+            i = ui.pick(T(f"{m.cp} установлен в нескольких слотах. Какой удалить?",
+                          f"{m.cp} is installed in several slots. Which one to remove?"), items)
+            if i is None:
+                ui.step(T("пропускаю", "skipping"))
+                continue
+            slot = inst[i][0] if i < len(inst) else ""
+        targets.append(f"{m.cp}:{slot}" if slot else m.cp)
+        ui.ok(f"{ui.badge('del')}  {pkg_line(m.e, idx, False)}" + (ui.cyan(":" + slot) if slot else ""))
     if not targets:
         return 1
 
@@ -2313,6 +2459,8 @@ def cmd_remove(a, argv):
         return run(["emerge", "--unmerge"] + targets)[0]
 
     rows = [[ui.badge("del"), ui.dim(t.split("/")[0] + "/") + ui.bold(t.split("/")[1])] for t in targets]
+    tcp = cpv_to_cp   # 'cat/pkg:slot' -> 'cat/pkg'
+    world = world_atoms()
     ui.head(T(f"Удалить ({len(targets)})", f"Remove ({len(targets)})"))
     ui.table(rows)
     ui.out()
@@ -2323,16 +2471,17 @@ def cmd_remove(a, argv):
     if not ui.ask(T("Удалить?", "Remove?"), True):
         return 1
     take_snapshot("remove " + " ".join(targets))
-    was_world = [t for t in targets if t in idx.world]
+    # a slot target leaves a plain 'cat/pkg' world entry alone: it may be what keeps another slot
+    was_world = [t for t in targets if t in world or (":" not in t and t in idx.world)]
     if was_world:
         run(["emerge", "--deselect"] + was_world, capture=True)
 
     ui.head(T("Проверяю, что от них зависит", "Checking what depends on them"))
     rc, out = run(["emerge", "--pretend", "--depclean", "--color=n"] + targets, capture=True)
     removable, pulled = parse_depclean(out)
-    blocked = [t for t in targets if t not in removable]
+    blocked = [t for t in targets if tcp(t) not in removable]
     for t in blocked:
-        who = pulled.get(t, [])
+        who = pulled.get(tcp(t), [])
         ui.warn(T(f"{ui.bold(t)} нужен другим пакетам", f"{ui.bold(t)} is needed by other packages") + (":" if who else ""))
         for w in who[:5]:
             ui.out("       " + ui.dim(w))
@@ -2341,13 +2490,13 @@ def cmd_remove(a, argv):
                 run(["emerge", "--noreplace", t], capture=True)
             else:
                 ui.out(ui.dim(T("     ок, он удалится сам, когда станет никому не нужен", "     ok, it will go away once nothing needs it")))
-    go = [t for t in targets if t in removable]
+    go = [t for t in targets if tcp(t) in removable]
     if not go:
         return 1
     rc = emerge_live(["--depclean"] + go)
     if rc == 0:
         if a.purge:
-            purge_records(go)
+            purge_records([tcp(t) for t in go])
         ui.ok(ui.bold(T("удалено: ", "removed: ")) + ", ".join(go))
         offer_orphans()
         after_ops()
@@ -2444,6 +2593,7 @@ def cmd_info(a, argv):
     vardb = portage.db[eroot]["vartree"].dbapi
     arch = portage.settings.get("ARCH", "amd64")
     vers = []
+    want = set(slot_cpvs(e["cp"], res.suffix[1:])) if res.suffix.startswith(":") else set()
     for cpv in portdb.cp_list(e["cp"]):
         try:
             kw, slot, lic, repo = portdb.aux_get(cpv, ["KEYWORDS", "SLOT", "LICENSE", "repository"])
@@ -2451,6 +2601,8 @@ def cmd_info(a, argv):
             continue
         k = kw.split()
         st = ui.green("stable") if arch in k else (ui.yellow("~" + arch) if "~" + arch in k else ui.red("masked"))
+        if res.suffix.startswith(":") and cpv not in want:
+            continue
         vers.append([ui.bold(cpv_version(cpv)), ui.dim(":" + slot.split("/")[0]), st, ui.magenta("::" + repo)])
     inst = [cpv_version(c) for c in vardb.match(e["cp"])]
     lines = [

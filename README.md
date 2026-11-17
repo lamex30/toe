@@ -14,6 +14,7 @@ toe update
 - **Says what downloads and what compiles.** When a package has a prebuilt `-bin` version (`firefox-bin`, `rust-bin`, …), toe asks which one you want and tells you whether the regular one would compile from source. Packages that compile get a warning before you say yes.
 - **Sorts out `/etc/portage` for you.** Keywords (`~amd64`), USE flags and licenses that emerge needs are shown once, written to toe's own `zz-toe-*` files on yes, and `toe undo` reverts them.
 - **Handles 32-bit dependencies.** Steam, Wine and friends need `abi_x86_32` on dozens of libraries. emerge names them one per run (and sometimes suggests turning the flag back off); toe walks the dependency tree and writes the whole list at once. `toe install steam` gets `games-util/steam-launcher`, not the `dev-python/steam` library.
+- **Understands slots.** `toe install sys-fs/fuse:0` (or `fuse:0`, `python@3.13`) installs exactly that slot, checks that the slot exists, and says "already installed" only when that slot is. When a package has several slots and you didn't name one, toe lists them, newest first, marking the installed ones, and asks. `toe remove fuse:0` removes just that slot; with several slots installed, toe asks which one, or all.
 - **Removes safely.** `toe remove` uses `--deselect` and `--depclean`, never `--unmerge`, and won't remove core system packages.
 - **Shows real progress.** Each package gets an OpenRC-style `[ ok ]` line and a progress bar with the ebuild phase and the `[n/m]` count read from its build log.
 - Speaks English or Russian, following the system's language (`TOE_LANG=en|ru` to pick one). In a Linux console (TTY) it uses only the characters the console font has.
@@ -44,7 +45,7 @@ It downloads the latest `toe` from this repository, checks that it is a working 
 
 | command | what it does |
 |---|---|
-| `toe install NAME…` (`i`) | find, choose binary or source, sort out keywords/USE/licenses, install |
+| `toe install NAME[:SLOT]…` (`i`) | find, choose binary or source, sort out keywords/USE/licenses, install |
 | `toe remove NAME…` (`rm`) | looks only among installed packages; `--deselect` + `--depclean` |
 | `toe search QUERY` (`s`) | by name and description |
 | `toe info NAME` | versions, slots, branches, license |
